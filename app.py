@@ -1,8 +1,12 @@
 # app.py — OMEC Stock Take (single-file)
-# Safe logo + Professional PDF exports (A3 Landscape) with:
+# A3 Landscape PDFs with:
 # - totals row (sum qty + total stock value)
-# - low-stock rows highlighted in red
-# - grouped inventory report by Category with subtotals
+# - low-stock rows highlighted
+# - grouped by Category with subtotals
+# - header shows Revision tag (e.g., Rev0.1)
+# - no extra gaps between categories
+# - Inventory report includes Notes column
+
 import os, json, math
 import streamlit as st
 import pandas as pd
@@ -15,7 +19,7 @@ from db import (
 )
 from utils import export_snapshot, timestamp
 
-# PDF export (fpdf2) — safe import so app still runs if the package is missing
+# PDF engine (fpdf2) — app still runs if missing
 try:
     from fpdf import FPDF
     FPDF_AVAILABLE = True
@@ -31,9 +35,9 @@ if os.path.exists(CONFIG_PATH):
     with open(CONFIG_PATH, "r") as f:
         CONFIG = json.load(f)
 else:
-    CONFIG = {"brand_name": "OMEC", "brand_color": "#0ea5e9", "logo_path": ""}
+    CONFIG = {"brand_name": "OMEC", "brand_color": "#0ea5e9", "logo_path": "", "revision_tag": "Rev0.1"}
 
-init_db()  # ensure SQLite schema exists
+init_db()
 
 # ---------- Helpers ----------
 def _norm_path(p: str) -> str:
@@ -55,7 +59,7 @@ def hex_to_rgb(h: str):
         h = h.lstrip("#")
         return tuple(int(h[i:i+2], 16) for i in (0, 2, 4))
     except Exception:
-        return (14, 165, 233)  # fallback cyan-ish
+        return (14, 165, 233)
 
 def lighten(rgb, factor=0.85):
     r, g, b = rgb
@@ -63,19 +67,20 @@ def lighten(rgb, factor=0.85):
 
 if FPDF_AVAILABLE:
     class BrandedPDF(FPDF):
-        def __init__(self, brand_name: str, brand_rgb: tuple, logo_path: str = "", *args, **kwargs):
+        def __init__(self, brand_name: str, brand_rgb: tuple, logo_path: str = "", revision_tag: str = "Rev0.1", *args, **kwargs):
             super().__init__(*args, **kwargs)
             self.brand_name = brand_name
             self.brand_rgb = brand_rgb
+            self.revision_tag = revision_tag
             self.logo_path = _norm_path(logo_path) if logo_path else ""
             self.set_auto_page_break(auto=True, margin=12)
 
         def header(self):
-            # Top brand bar
+            # Brand bar
             self.set_fill_color(*lighten(self.brand_rgb, 0.75))
             self.rect(x=0, y=0, w=self.w, h=14, style="F")
 
-            # Logo (if any)
+            # Logo
             x = 10
             if self.logo_path and os.path.exists(self.logo_path):
                 try:
@@ -90,12 +95,12 @@ if FPDF_AVAILABLE:
             self.set_font("Helvetica", "B", 12)
             self.cell(0, 6, txt=self.brand_name, ln=0)
 
-            # Date on right
+            # Revision on right
             self.set_xy(-80, 4)
             self.set_font("Helvetica", "", 9)
-            self.cell(70, 6, txt=f"Generated: {timestamp()}", ln=0, align="R")
+            self.cell(70, 6, txt=f"Revision: {self.revision_tag}", ln=0, align="R")
 
-            # Second divider line
+            # Divider
             self.set_draw_color(*self.brand_rgb)
             self.set_line_width(0.4)
             self.line(8, 14, self.w - 8, 14)
@@ -111,14 +116,13 @@ if FPDF_AVAILABLE:
             self.set_text_color(80, 80, 80)
             self.cell(0, 6, f"Page {self.page_no()}", align="R")
 
-# --- PDF utils (inventory grouped/subtotals/low-stock highlighting) ----------
+# ---------- PDF helpers (inventory grouped/subtotals/low-stock) ----------
 def _text_lines_needed(pdf, w, txt, line_h):
     if txt is None:
         return 1
     s = str(txt)
     if not s:
         return 1
-    # crude wrap estimate
     char_w = max(pdf.get_string_width("M"), 1e-6)
     max_chars = max(int((w - 2) / (char_w if char_w else 1)), 1)
     return max(1, math.ceil(len(s) / max(1, max_chars)))
@@ -129,11 +133,11 @@ def _compute_col_widths(pdf, columns, rows, page_w, font_size):
     for c in columns:
         max_w = pdf.get_string_width(str(c)) + 6
         pdf.set_font("Helvetica", "", font_size)
-        for r in rows:
+        for r in rows[:200]:
             w = pdf.get_string_width(str(r.get(c, ""))) + 6
             if w > max_w:
                 max_w = w
-        max_w = max(18, min(max_w, 80))
+        max_w = max(18, min(max_w, 100))
         widths.append(max_w)
     total_w = sum(widths)
     if total_w > page_w:
@@ -180,7 +184,6 @@ def _draw_row(pdf, values, widths, row_h, align_map=None, fill_rgb=None, bold=Fa
         heights.append(lines * row_h)
     max_h = max(heights) if heights else row_h
 
-    # draw cells
     x_left = pdf.get_x()
     for idx, (w, v) in enumerate(zip(widths, values)):
         x = pdf.get_x()
@@ -195,28 +198,31 @@ def _draw_row(pdf, values, widths, row_h, align_map=None, fill_rgb=None, bold=Fa
         pdf.set_xy(x + w, y_start)
     pdf.set_xy(x_left, y_start + max_h)
 
-def _inventory_pdf_bytes_grouped(df: pd.DataFrame, brand_name, brand_rgb, logo_path) -> bytes:
-    # Derive value column
+def _inventory_pdf_bytes_grouped(df: pd.DataFrame, brand_name, brand_rgb, logo_path, revision_tag) -> bytes:
     df = df.copy()
     df["quantity"] = pd.to_numeric(df.get("quantity"), errors="coerce").fillna(0.0)
     df["min_qty"] = pd.to_numeric(df.get("min_qty"), errors="coerce").fillna(0.0)
     df["unit_cost"] = pd.to_numeric(df.get("unit_cost"), errors="coerce").fillna(0.0)
     df["value"] = (df["quantity"] * df["unit_cost"]).round(2)
 
-    # Order & rename for display
-    key_cols = ["sku", "name", "category", "location", "unit", "quantity", "min_qty", "unit_cost", "value", "updated_at"]
+    # Include Notes column
+    key_cols = [
+        "sku", "name", "category", "location", "unit",
+        "quantity", "min_qty", "unit_cost", "value", "notes", "updated_at"
+    ]
     present = [c for c in key_cols if c in df.columns]
     df = df[present]
 
     col_names = {
         "sku": "SKU", "name": "Name", "category": "Category", "location": "Location",
-        "unit": "Unit", "quantity": "Qty", "min_qty": "Min", "unit_cost": "Unit Cost (R)",
-        "value": "Value (R)", "updated_at": "Updated"
+        "unit": "Unit", "quantity": "Qty", "min_qty": "Min",
+        "unit_cost": "Unit Cost (R)", "value": "Value (R)",
+        "notes": "Notes", "updated_at": "Updated"
     }
     display_cols = [col_names.get(c, c) for c in present]
 
-    # Format rows for width estimation
     def fmt_num(x, places=2): return f"{x:,.{places}f}"
+
     rows_for_width = []
     for _, r in df.iterrows():
         row = {}
@@ -229,13 +235,13 @@ def _inventory_pdf_bytes_grouped(df: pd.DataFrame, brand_name, brand_rgb, logo_p
             row[col_names.get(c, c)] = "" if v is None else str(v)
         rows_for_width.append(row)
 
-    # Build PDF
-    pdf = BrandedPDF(brand_name=brand_name, brand_rgb=brand_rgb, logo_path=logo_path,
-                     orientation="L", unit="mm", format="A3")
+    pdf = BrandedPDF(
+        brand_name=brand_name, brand_rgb=brand_rgb, logo_path=logo_path, revision_tag=revision_tag,
+        orientation="L", unit="mm", format="A3"
+    )
     pdf.add_page()
     pdf.set_text_color(30, 30, 30)
 
-    # Title + meta
     pdf.set_font("Helvetica", "B", 16)
     pdf.cell(0, 10, "Inventory Report", ln=1)
     pdf.set_font("Helvetica", "", 10)
@@ -246,10 +252,10 @@ def _inventory_pdf_bytes_grouped(df: pd.DataFrame, brand_name, brand_rgb, logo_p
     widths = _compute_col_widths(pdf, display_cols, rows_for_width, page_w, font_size=9)
     header_h = _draw_header_row(pdf, display_cols, widths, 9, brand_rgb)
 
-    # Alignment (numbers right aligned)
+    # Right alignment for numeric fields
     align_map = {present.index(c): "R" for c in present if c in ("quantity", "min_qty", "unit_cost", "value")}
 
-    # Group by category
+    # Grouping
     if "category" in df.columns:
         df_sorted = df.sort_values(by=["category", "sku", "name"], kind="stable")
         categories = df_sorted["category"].fillna("(Unspecified)").unique().tolist()
@@ -268,7 +274,7 @@ def _inventory_pdf_bytes_grouped(df: pd.DataFrame, brand_name, brand_rgb, logo_p
     for cat in categories:
         block = df_sorted[df_sorted["category"].fillna("(Unspecified)") == cat]
 
-        # Category bar
+        # Category bar (no added blank lines afterward)
         span_h = 7
         _ensure_page_space(pdf, span_h + header_h, display_cols, widths, 9, brand_rgb)
         pdf.set_font("Helvetica", "B", 11)
@@ -291,13 +297,12 @@ def _inventory_pdf_bytes_grouped(df: pd.DataFrame, brand_name, brand_rgb, logo_p
                 elif c in ("unit_cost", "value"):
                     v = fmt_num(float(v), 2)
                 vals.append(v if v is not None else "")
-            # low-stock highlight
             fill = low_stock_fill if float(r["quantity"]) < float(r["min_qty"]) else None
             row_h = 7
             _ensure_page_space(pdf, row_h + 2, display_cols, widths, 9, brand_rgb)
             _draw_row(pdf, vals, widths, row_h, align_map=align_map, fill_rgb=fill)
 
-        # Category subtotal
+        # Category subtotal (no extra pdf.ln afterwards)
         sub_vals = []
         for c in present:
             if c == "sku":
@@ -310,8 +315,6 @@ def _inventory_pdf_bytes_grouped(df: pd.DataFrame, brand_name, brand_rgb, logo_p
                 sub_vals.append("")
         _ensure_page_space(pdf, 7, display_cols, widths, 9, brand_rgb)
         _draw_row(pdf, sub_vals, widths, 7, align_map=align_map, fill_rgb=light_brand, bold=True)
-
-        pdf.ln(1)
 
     # Grand total row
     total_vals = []
@@ -330,7 +333,7 @@ def _inventory_pdf_bytes_grouped(df: pd.DataFrame, brand_name, brand_rgb, logo_p
     data = pdf.output(dest="S")
     return bytes(data) if isinstance(data, (bytes, bytearray)) else str(data).encode("latin-1", errors="ignore")
 
-# Generic table (used for Transactions PDF)
+# Generic table (Transactions PDF)
 def _text_lines_needed_table(pdf, w, txt, line_h):
     if not txt:
         return 1
@@ -356,7 +359,7 @@ def draw_table(pdf, df: pd.DataFrame, header_fill_rgb: tuple, col_order=None, co
             w = pdf.get_string_width(str(df.iloc[i][col])) + 6
             if w > max_w:
                 max_w = w
-        max_w = max(18, min(max_w, 80))
+        max_w = max(18, min(max_w, 100))
         widths.append(max_w)
 
     total_w = sum(widths)
@@ -369,7 +372,6 @@ def draw_table(pdf, df: pd.DataFrame, header_fill_rgb: tuple, col_order=None, co
             bump = extra / len(widths)
             widths = [w + bump for w in widths]
 
-    # Header
     pdf.set_font("Helvetica", "B", font_size)
     pdf.set_fill_color(*lighten(header_fill_rgb, 0.85))
     pdf.set_text_color(20, 20, 20)
@@ -381,7 +383,6 @@ def draw_table(pdf, df: pd.DataFrame, header_fill_rgb: tuple, col_order=None, co
         pdf.set_xy(x + w, y0)
     pdf.ln(row_h)
 
-    # Rows
     pdf.set_font("Helvetica", "", font_size)
     pdf.set_text_color(15, 15, 15)
     for idx in range(len(df)):
@@ -394,7 +395,6 @@ def draw_table(pdf, df: pd.DataFrame, header_fill_rgb: tuple, col_order=None, co
 
         if y_start + max_h > pdf.h - pdf.b_margin:
             pdf.add_page()
-            # redraw header
             pdf.set_font("Helvetica", "B", font_size)
             pdf.set_fill_color(*lighten(header_fill_rgb, 0.85))
             pdf.set_text_color(20, 20, 20)
@@ -416,9 +416,11 @@ def draw_table(pdf, df: pd.DataFrame, header_fill_rgb: tuple, col_order=None, co
             pdf.set_xy(x + w, y_start)
         pdf.set_xy(x_left, y_start + max_h)
 
-def df_to_pdf_bytes_pro(title: str, df: pd.DataFrame, meta_lines, brand_name: str, brand_rgb: tuple, logo_path: str) -> bytes:
-    pdf = BrandedPDF(brand_name=brand_name, brand_rgb=brand_rgb, logo_path=logo_path,
-                     orientation="L", unit="mm", format="A3")
+def df_to_pdf_bytes_pro(title: str, df: pd.DataFrame, meta_lines, brand_name: str, brand_rgb: tuple, logo_path: str, revision_tag: str) -> bytes:
+    pdf = BrandedPDF(
+        brand_name=brand_name, brand_rgb=brand_rgb, logo_path=logo_path, revision_tag=revision_tag,
+        orientation="L", unit="mm", format="A3"
+    )
     pdf.add_page()
     pdf.set_text_color(30, 30, 30)
     pdf.set_font("Helvetica", "B", 16)
@@ -436,6 +438,7 @@ def df_to_pdf_bytes_pro(title: str, df: pd.DataFrame, meta_lines, brand_name: st
 logo_path = get_setting("logo_path", CONFIG.get("logo_path", ""))
 brand_name = get_setting("brand_name", CONFIG.get("brand_name", "OMEC"))
 brand_color = get_setting("brand_color", CONFIG.get("brand_color", "#0ea5e9"))
+revision_tag = get_setting("revision_tag", CONFIG.get("revision_tag", "Rev0.1"))
 brand_rgb = hex_to_rgb(brand_color)
 
 # ---------- Sidebar ----------
@@ -596,19 +599,19 @@ def view_versions():
 
 def view_reports():
     st.title("🧾 Reports & Export (PDF)")
-    st.caption("A3 landscape • group by category • subtotals • low-stock highlight • totals row")
+    st.caption("A3 landscape • grouped by category • subtotals • low-stock highlight • totals row • Notes column")
 
     if not FPDF_AVAILABLE:
         st.error("PDF engine not available. Add `fpdf2==2.7.9` to requirements.txt.")
         return
 
-    # ---------- Inventory PDF (grouped) ----------
+    # Inventory PDF
     st.subheader("Inventory Report")
     items = get_items()
     df_items = pd.DataFrame(items)
 
     if not df_items.empty:
-        pdf_bytes = _inventory_pdf_bytes_grouped(df_items, brand_name, brand_rgb, logo_path)
+        pdf_bytes = _inventory_pdf_bytes_grouped(df_items, brand_name, brand_rgb, logo_path, revision_tag)
         st.download_button(
             "Download Inventory PDF",
             data=pdf_bytes,
@@ -618,7 +621,7 @@ def view_reports():
     else:
         st.info("No items to include in the report.")
 
-    # ---------- Transactions PDF (simple table) ----------
+    # Transactions PDF (simple)
     st.subheader("Transaction Log")
     tx = get_transactions(limit=100_000)
     df_tx = pd.DataFrame(tx)
@@ -634,7 +637,7 @@ def view_reports():
             "Transaction Log",
             df_tx,
             [f"Rows: {len(df_tx)}"],
-            brand_name, brand_rgb, logo_path
+            brand_name, brand_rgb, logo_path, revision_tag
         )
         st.download_button(
             "Download Transactions PDF",
@@ -679,10 +682,13 @@ def view_settings():
     current_brand = get_setting("brand_name", CONFIG.get("brand_name", "OMEC"))
     current_color = get_setting("brand_color", CONFIG.get("brand_color", "#0ea5e9"))
     current_logo = get_setting("logo_path", CONFIG.get("logo_path", ""))
+    current_rev  = get_setting("revision_tag", CONFIG.get("revision_tag", "Rev0.1"))
 
     col1, col2 = st.columns(2)
     brand_name_in = col1.text_input("Brand Name", value=current_brand)
     brand_color_in = col2.color_picker("Brand Color", value=current_color)
+
+    rev = st.text_input("Revision tag to show on PDFs (e.g., Rev0.1)", value=current_rev)
 
     st.subheader("Logo")
     upload = st.file_uploader("Upload a PNG/JPG logo", type=["png", "jpg", "jpeg"])
@@ -704,6 +710,7 @@ def view_settings():
         upsert_setting("brand_name", brand_name_in)
         upsert_setting("brand_color", brand_color_in)
         upsert_setting("logo_path", selected)
+        upsert_setting("revision_tag", rev)
         st.success("Settings saved. Refresh to apply.")
     if c2.button("Clear Logo"):
         upsert_setting("logo_path", "")
@@ -712,6 +719,7 @@ def view_settings():
         upsert_setting("brand_name", "OMEC")
         upsert_setting("brand_color", "#0ea5e9")
         upsert_setting("logo_path", "assets/logo_OMEC.png")
+        upsert_setting("revision_tag", "Rev0.1")
         st.success("Default branding applied. Refresh to see it.")
 
 # ---------- Router ----------
