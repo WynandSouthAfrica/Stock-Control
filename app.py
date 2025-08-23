@@ -117,7 +117,6 @@ def _text_lines_needed(pdf, w, txt, line_h):
         return 1
     char_w = max(pdf.get_string_width("M"), 1e-6)
     max_chars = max(int((w - 2) / (char_w if char_w else 1)), 1)
-    # ensure at least one line
     return max(1, math.ceil(len(str(txt)) / max(1, max_chars)))
 
 def draw_table(pdf, df: pd.DataFrame, header_fill_rgb: tuple, col_order=None, col_rename=None, font_size=9):
