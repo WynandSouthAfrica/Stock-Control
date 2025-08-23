@@ -11,8 +11,12 @@ from db import (
 )
 from utils import export_snapshot, timestamp
 
-# PDF export (fpdf2)
-from fpdf import FPDF
+# PDF export (fpdf2) — safe import so app still runs if package missing
+try:
+    from fpdf import FPDF
+    FPDF_AVAILABLE = True
+except Exception:
+    FPDF_AVAILABLE = False
 
 st.set_page_config(page_title="OMEC Stock Take", page_icon="🗃️", layout="wide")
 
@@ -57,120 +61,125 @@ def lighten(rgb, factor=0.85):
     r, g, b = rgb
     return (int(r + (255 - r) * factor), int(g + (255 - g) * factor), int(b + (255 - b) * factor))
 
-class BrandedPDF(FPDF):
-    def __init__(self, brand_name: str, brand_rgb: tuple, logo_path: str = "", *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.brand_name = brand_name
-        self.brand_rgb = brand_rgb
-        self.logo_path = _norm_path(logo_path) if logo_path else ""
-        self.set_auto_page_break(auto=True, margin=12)
+if FPDF_AVAILABLE:
+    class BrandedPDF(FPDF):
+        def __init__(self, brand_name: str, brand_rgb: tuple, logo_path: str = "", *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.brand_name = brand_name
+            self.brand_rgb = brand_rgb
+            self.logo_path = _norm_path(logo_path) if logo_path else ""
+            self.set_auto_page_break(auto=True, margin=12)
 
-    def header(self):
-        # Top brand bar
-        self.set_fill_color(*lighten(self.brand_rgb, 0.75))
-        self.rect(x=0, y=0, w=self.w, h=14, style="F")
+        def header(self):
+            # Top brand bar
+            self.set_fill_color(*lighten(self.brand_rgb, 0.75))
+            self.rect(x=0, y=0, w=self.w, h=14, style="F")
 
-        # Logo (if any)
-        x = 10
-        if self.logo_path and os.path.exists(self.logo_path):
-            try:
-                self.image(self.logo_path, x=x, y=3, h=8)
-                x += 26
-            except Exception:
-                pass
+            # Logo (if any)
+            x = 10
+            if self.logo_path and os.path.exists(self.logo_path):
+                try:
+                    self.image(self.logo_path, x=x, y=3, h=8)
+                    x += 26
+                except Exception:
+                    pass
 
-        # Brand name
-        self.set_xy(x, 4)
-        self.set_text_color(25, 25, 25)
-        self.set_font("Helvetica", "B", 12)
-        self.cell(0, 6, txt=self.brand_name, ln=0)
+            # Brand name
+            self.set_xy(x, 4)
+            self.set_text_color(25, 25, 25)
+            self.set_font("Helvetica", "B", 12)
+            self.cell(0, 6, txt=self.brand_name, ln=0)
 
-        # Date on right
-        self.set_xy(-80, 4)
-        self.set_font("Helvetica", "", 9)
-        self.cell(70, 6, txt=f"Generated: {timestamp()}", ln=0, align="R")
+            # Date on right
+            self.set_xy(-80, 4)
+            self.set_font("Helvetica", "", 9)
+            self.cell(70, 6, txt=f"Generated: {timestamp()}", ln=0, align="R")
 
-        # Second divider line
-        self.set_draw_color(*self.brand_rgb)
-        self.set_line_width(0.4)
-        self.line(8, 14, self.w - 8, 14)
-        self.ln(9)
+            # Second divider line
+            self.set_draw_color(*self.brand_rgb)
+            self.set_line_width(0.4)
+            self.line(8, 14, self.w - 8, 14)
+            self.ln(9)
 
-    def footer(self):
-        self.set_y(-10)
-        self.set_draw_color(*self.brand_rgb)
-        self.set_line_width(0.2)
-        self.line(8, self.get_y(), self.w - 8, self.get_y())
-        self.set_y(-8)
-        self.set_font("Helvetica", "I", 8)
-        self.set_text_color(80, 80, 80)
-        self.cell(0, 6, f"Page {self.page_no()}", align="R")
+        def footer(self):
+            self.set_y(-10)
+            self.set_draw_color(*self.brand_rgb)
+            self.set_line_width(0.2)
+            self.line(8, self.get_y(), self.w - 8, self.get_y())
+            self.set_y(-8)
+            self.set_font("Helvetica", "I", 8)
+            self.set_text_color(80, 80, 80)
+            self.cell(0, 6, f"Page {self.page_no()}", align="R")
 
-def draw_table(pdf: BrandedPDF, df: pd.DataFrame, header_fill_rgb: tuple, col_order=None, col_rename=None, font_size=9):
-    """Draw a table across pages with auto column widths and wrapped cells."""
+def _text_lines_needed(pdf, w, txt, line_h):
+    # crude wrap estimate based on string width
+    if not txt:
+        return 1
+    char_w = max(pdf.get_string_width("M"), 1e-6)
+    max_chars = max(int((w - 2) / (char_w if char_w else 1)), 1)
+    # ensure at least one line
+    return max(1, math.ceil(len(str(txt)) / max(1, max_chars)))
+
+def draw_table(pdf, df: pd.DataFrame, header_fill_rgb: tuple, col_order=None, col_rename=None, font_size=9):
+    """Draw a table across pages with auto column widths and wrapped cells (fpdf2)."""
     if col_order is not None:
         df = df.loc[:, [c for c in col_order if c in df.columns]]
     if col_rename:
         df = df.rename(columns=col_rename)
 
-    # Calculate column widths based on content
+    # Column widths based on header + sample rows
     pdf.set_font("Helvetica", "B", font_size)
     page_w = pdf.w - pdf.l_margin - pdf.r_margin
-    # max width in mm for each column based on header and first N rows
     measure_rows = min(len(df), 200)
+
     widths = []
     for col in df.columns:
-        max_w = pdf.get_string_width(str(col)) + 4
+        max_w = pdf.get_string_width(str(col)) + 6
         pdf.set_font("Helvetica", "", font_size)
         for i in range(measure_rows):
-            w = pdf.get_string_width(str(df.iloc[i][col])) + 4
+            w = pdf.get_string_width(str(df.iloc[i][col])) + 6
             if w > max_w:
                 max_w = w
-        # clamp per column
         max_w = max(18, min(max_w, 70))
         widths.append(max_w)
 
-    # scale widths to fit page if necessary
     total_w = sum(widths)
     if total_w > page_w:
         scale = page_w / total_w
         widths = [w * scale for w in widths]
     else:
-        # distribute remaining space to wider columns
         extra = page_w - total_w
         if extra > 0 and len(widths) > 0:
             bump = extra / len(widths)
             widths = [w + bump for w in widths]
 
-    # Header row
+    # Header
     pdf.set_font("Helvetica", "B", font_size)
     pdf.set_fill_color(*lighten(header_fill_rgb, 0.85))
     pdf.set_text_color(20, 20, 20)
     row_h = 7
-    x0 = pdf.get_x()
     y0 = pdf.get_y()
     for w, col in zip(widths, df.columns):
-        pdf.multi_cell(w, row_h, str(col), border=1, align="L", fill=True, ln=3, max_line_height=pdf.font_size)
-        pdf.set_xy(pdf.get_x() + w, y0)
+        x = pdf.get_x()
+        pdf.multi_cell(w, row_h, str(col), border=1, align="L", fill=True, new_x="RIGHT", new_y="TOP")
+        pdf.set_xy(x + w, y0)
     pdf.ln(row_h)
 
-    # Body rows
+    # Rows
     pdf.set_font("Helvetica", "", font_size)
     pdf.set_text_color(15, 15, 15)
     for idx in range(len(df)):
-        y_before = pdf.get_y()
-        max_cell_h = row_h
-        # measure wrapped height per cell
-        cell_texts = [str(v) for v in df.iloc[idx].tolist()]
-        for w, txt in zip(widths, cell_texts):
-            h = pdf.get_string_width(txt)  # proxy; we will use multi_cell anyway
-            lines = max(1, math.ceil((pdf.get_string_width(txt) + 1) / (w - 2)))
-            h = lines * row_h
-            if h > max_cell_h:
-                max_cell_h = h
+        y_start = pdf.get_y()
 
-        # page break check
-        if pdf.get_y() + max_cell_h > pdf.h - pdf.b_margin:
+        # compute row height by estimating line counts for each cell
+        heights = []
+        for w, val in zip(widths, df.iloc[idx].tolist()):
+            lines = _text_lines_needed(pdf, w, str(val), row_h)
+            heights.append(lines * row_h)
+        max_h = max(heights) if heights else row_h
+
+        # page break
+        if y_start + max_h > pdf.h - pdf.b_margin:
             pdf.add_page()
             # redraw header
             pdf.set_font("Helvetica", "B", font_size)
@@ -178,18 +187,22 @@ def draw_table(pdf: BrandedPDF, df: pd.DataFrame, header_fill_rgb: tuple, col_or
             pdf.set_text_color(20, 20, 20)
             y0 = pdf.get_y()
             for w, col in zip(widths, df.columns):
-                pdf.multi_cell(w, row_h, str(col), border=1, align="L", fill=True, ln=3, max_line_height=pdf.font_size)
-                pdf.set_xy(pdf.get_x() + w, y0)
+                x = pdf.get_x()
+                pdf.multi_cell(w, row_h, str(col), border=1, align="L", fill=True, new_x="RIGHT", new_y="TOP")
+                pdf.set_xy(x + w, y0)
             pdf.ln(row_h)
             pdf.set_font("Helvetica", "", font_size)
             pdf.set_text_color(15, 15, 15)
+            y_start = pdf.get_y()
 
-        x = pdf.get_x()
-        y = pdf.get_y()
-        for w, txt in zip(widths, cell_texts):
-            pdf.multi_cell(w, row_h, txt, border=1, align="L", ln=3, max_line_height=pdf.font_size)
-            pdf.set_xy(pdf.get_x() + w, y)
-        pdf.ln(max_cell_h if max_cell_h > row_h else row_h)
+        # draw row
+        x_left = pdf.get_x()
+        for w, val in zip(widths, df.iloc[idx].tolist()):
+            txt = str(val)
+            x = pdf.get_x()
+            pdf.multi_cell(w, row_h, txt, border=1, align="L", new_x="RIGHT", new_y="TOP")
+            pdf.set_xy(x + w, y_start)
+        pdf.set_xy(x_left, y_start + max_h)
 
 def df_to_pdf_bytes_pro(
     title: str,
@@ -199,7 +212,8 @@ def df_to_pdf_bytes_pro(
     brand_rgb: tuple,
     logo_path: str
 ) -> bytes:
-    pdf = BrandedPDF(brand_name=brand_name, brand_rgb=brand_rgb, logo_path=logo_path, orientation="L", unit="mm", format="A4")
+    pdf = BrandedPDF(brand_name=brand_name, brand_rgb=brand_rgb, logo_path=logo_path,
+                     orientation="L", unit="mm", format="A4")
     pdf.add_page()
     pdf.set_text_color(30, 30, 30)
     pdf.set_font("Helvetica", "B", 15)
@@ -209,7 +223,6 @@ def df_to_pdf_bytes_pro(
     for line in meta_lines:
         pdf.cell(0, 6, txt=str(line), ln=1)
     pdf.ln(2)
-
     draw_table(pdf, df, header_fill_rgb=brand_rgb, font_size=9)
     return pdf.output(dest="S").encode("latin-1", errors="ignore")
 
@@ -379,32 +392,26 @@ def view_reports():
     st.title("🧾 Reports & Export (PDF)")
     st.caption("Generate branded PDF reports for inventory and transactions.")
 
+    if not FPDF_AVAILABLE:
+        st.error("PDF engine not available. Add `fpdf2==2.7.9` to requirements.txt.")
+        return
+
     # ---------- Inventory PDF ----------
     st.subheader("Inventory Report")
     items = get_items()
     df_items = pd.DataFrame(items)
 
     if not df_items.empty:
-        # Choose columns & order for a clean report
         col_order = ["sku", "name", "category", "location", "unit", "quantity", "min_qty", "unit_cost", "updated_at"]
         col_names = {
-            "sku": "SKU",
-            "name": "Name",
-            "category": "Category",
-            "location": "Location",
-            "unit": "Unit",
-            "quantity": "Qty",
-            "min_qty": "Min",
-            "unit_cost": "Unit Cost (R)",
-            "updated_at": "Updated",
+            "sku": "SKU", "name": "Name", "category": "Category", "location": "Location",
+            "unit": "Unit", "quantity": "Qty", "min_qty": "Min", "unit_cost": "Unit Cost (R)", "updated_at": "Updated",
         }
         pdf_bytes = df_to_pdf_bytes_pro(
             "Inventory Report",
             df_items.loc[:, [c for c in col_order if c in df_items.columns]].rename(columns=col_names),
             [f"Rows: {len(df_items)}"],
-            brand_name,
-            brand_rgb,
-            logo_path,
+            brand_name, brand_rgb, logo_path
         )
         st.download_button(
             "Download Inventory PDF",
@@ -423,22 +430,14 @@ def view_reports():
     if not df_tx.empty:
         col_order = ["ts", "sku", "qty_change", "reason", "project", "reference", "user", "notes"]
         col_names = {
-            "ts": "Timestamp",
-            "sku": "SKU",
-            "qty_change": "Δ Qty",
-            "reason": "Reason",
-            "project": "Project/Job",
-            "reference": "Reference",
-            "user": "User",
-            "notes": "Notes",
+            "ts": "Timestamp", "sku": "SKU", "qty_change": "Δ Qty", "reason": "Reason",
+            "project": "Project/Job", "reference": "Reference", "user": "User", "notes": "Notes",
         }
         pdf_bytes_tx = df_to_pdf_bytes_pro(
             "Transaction Log",
             df_tx.loc[:, [c for c in col_order if c in df_tx.columns]].rename(columns=col_names),
             [f"Rows: {len(df_tx)}"],
-            brand_name,
-            brand_rgb,
-            logo_path,
+            brand_name, brand_rgb, logo_path
         )
         st.download_button(
             "Download Transactions PDF",
