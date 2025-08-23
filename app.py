@@ -1,5 +1,5 @@
 # app.py — OMEC Stock Take (Streamlit)
-# Build: Issue Sheets (blank lines per item), editing UX, category normalization, A3/A4 PDFs, snapshots, etc.
+# Build: Issue Sheets with ruled lines, editing UX, category normalization, A3/A4 PDFs, snapshots, etc.
 
 import os, json, re, io, zipfile, glob, math
 import datetime as dt
@@ -83,13 +83,10 @@ def get_bool_setting(name: str, default: bool) -> bool:
     raw = str(get_setting(name, str(default))).strip().lower()
     return raw in {"1", "true", "yes", "y", "on"}
 
-# --- Category normalization utility ---
 def normalize_category(cat):
-    if cat is None:
-        return None
+    if cat is None: return None
     s = str(cat).strip()
-    if not s:
-        return None
+    if not s: return None
     s = re.sub(r"\s+", " ", s)
     return s.title()
 
@@ -127,9 +124,7 @@ menu = st.sidebar.radio(
 )
 
 # ---------- Auto-backup (daily) ----------
-def _today_stamp():
-    return dt.date.today().isoformat()
-
+def _today_stamp(): return dt.date.today().isoformat()
 def _has_snapshot_for_today():
     patt = os.path.join(SNAP_DIR, f"*{dt.date.today().strftime('%Y%m%d')}*.zip")
     return bool(glob.glob(patt))
@@ -410,7 +405,7 @@ def _inventory_pdf_bytes_grouped(
             fill = low_stock_fill if float(r["quantity"]) < float(r["min_qty"]) else None
             row_h = 7
             _ensure_page_space(pdf, row_h + 2, display_cols, widths, 9, brand_rgb)
-            _draw_row(pdf, vals, widths, row_h, align_map=align_map, fill_rgb=fill, wrap_idx_set=wrap_idx_set)
+            _draw_row(pdf, vals, widths, row_h, align_map=align_map, fill_rgb=fill, wrap_idx_set=set())
 
         sub_vals = []
         for c in present:
@@ -423,7 +418,7 @@ def _inventory_pdf_bytes_grouped(
             else:
                 sub_vals.append("")
         _ensure_page_space(pdf, 7, display_cols, widths, 9, brand_rgb)
-        _draw_row(pdf, sub_vals, widths, 7, align_map=align_map, fill_rgb=light_brand, bold=True, wrap_idx_set=wrap_idx_set)
+        _draw_row(pdf, sub_vals, widths, 7, align_map=align_map, fill_rgb=light_brand, bold=True, wrap_idx_set=set())
 
     total_vals = []
     for c in present:
@@ -436,7 +431,7 @@ def _inventory_pdf_bytes_grouped(
         else:
             total_vals.append("")
     _ensure_page_space(pdf, 8, display_cols, widths, 9, brand_rgb)
-    _draw_row(pdf, total_vals, widths, 8, align_map=align_map, fill_rgb=lighten(brand_rgb, 0.88), bold=True, wrap_idx_set=wrap_idx_set)
+    _draw_row(pdf, total_vals, widths, 8, align_map=align_map, fill_rgb=lighten(brand_rgb, 0.88), bold=True, wrap_idx_set=set())
 
     pdf.ln(6)
     pdf.set_font("Helvetica", "B", 10)
@@ -467,9 +462,8 @@ def _issue_sheet_pdf_bytes(
     blanks_cap: int = 12, fixed_blanks: int | None = None
 ) -> bytes:
     """
-    Draws one summary row per item (showing On-hand), then appends blank rows
-    for writing issues. Blank rows count = min(int(On-hand) + 1, blanks_cap),
-    unless fixed_blanks is provided (then use that constant).
+    Summary row per item (shows On-hand), then ruled blank rows for write-ins.
+    Blank rows = min(int(On-hand) + 1, blanks_cap) unless fixed_blanks is set.
     """
     df = df.copy()
     if "category" in df.columns:
@@ -523,6 +517,7 @@ def _issue_sheet_pdf_bytes(
     page_w = pdf.w - pdf.l_margin - pdf.r_margin
     widths = _compute_col_widths(pdf, display_cols, rows_for_width, page_w, font_size=9)
 
+    # Ensure writing columns are nice and wide
     for i, name in enumerate(display_cols):
         if name in {"Qty Issued"}:            widths[i] = max(widths[i], 20)
         if name in {"To (Person)"}:           widths[i] = max(widths[i], 35)
@@ -540,6 +535,19 @@ def _issue_sheet_pdf_bytes(
         groups = ["(All)"]
         df["category"] = "(All)"
 
+    def draw_ruled_blank_row(pdf, widths, row_h=7, line_rgb=(170,170,170)):
+        """Draws a light grey grid row (no text) for neat handwriting."""
+        y = pdf.get_y()
+        x = pdf.l_margin
+        pdf.set_x(x)
+        pdf.set_draw_color(*line_rgb)
+        pdf.set_line_width(0.2)
+        # outer boxes per column
+        for w in widths:
+            pdf.rect(x, y, w, row_h)
+            x += w
+        pdf.set_y(y + row_h)
+
     for cat in groups:
         block = df[df["category"].fillna("(Unspecified)") == cat]
         if block.empty:
@@ -556,7 +564,7 @@ def _issue_sheet_pdf_bytes(
             onhand = float(r.get("quantity") or 0.0)
             minq   = float(r.get("min_qty") or 0.0)
 
-            # Summary row with totals visible
+            # Summary (values) row
             values = [
                 r.get("sku",""),
                 r.get("name",""),
@@ -568,17 +576,16 @@ def _issue_sheet_pdf_bytes(
             _ensure_page_space(pdf, 8, display_cols, widths, 9, brand_rgb)
             _draw_row(pdf, values, widths, 7, align_map=align_map, border="1")
 
-            # How many blank lines under this item?
+            # Number of ruled blanks under this item
             if fixed_blanks is not None and fixed_blanks > 0:
                 blanks = fixed_blanks
             else:
                 blanks = min(max(0, int(math.floor(onhand))) + 1, max(1, int(blanks_cap)))
 
-            # Draw blank sign-off rows
+            # Draw ruled, boxed blank rows
             for _i in range(blanks):
-                blank_vals = ["", "", "", "", "", "", "", "", ""]
-                _ensure_page_space(pdf, 8, display_cols, widths, 9, brand_rgb)
-                _draw_row(pdf, blank_vals, widths, 7, align_map=align_map, border="1")
+                _ensure_page_space(pdf, 7, display_cols, widths, 9, brand_rgb)
+                draw_ruled_blank_row(pdf, widths, row_h=7, line_rgb=(170,170,170))
 
     # Footer sign-off
     pdf.ln(6)
@@ -873,7 +880,7 @@ def view_transactions():
 # ---------- NEW: Issue Sheets ----------
 def view_issue_sheets():
     st.title("📝 Issue Sheets")
-    st.caption("Create a printable Stock Issue Sheet (PPE & consumables) with blank sign-off rows, and log issues quickly.")
+    st.caption("Create a printable Stock Issue Sheet (PPE & consumables) with ruled blank sign-off rows, and log issues quickly.")
 
     if not FPDF_AVAILABLE:
         st.error("PDF engine not available. Add `fpdf2==2.7.9` to requirements.txt.")
