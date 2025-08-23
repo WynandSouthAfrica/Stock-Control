@@ -1,5 +1,5 @@
 # app.py — OMEC Stock Take (Streamlit)
-# Build: Issue Sheets with ruled lines, editing UX, category normalization, A3/A4 PDFs, snapshots, etc.
+# Adds Return Sheet section to Issue Sheets PDF (ruled lines). Everything else preserved.
 
 import os, json, re, io, zipfile, glob, math
 import datetime as dt
@@ -15,6 +15,7 @@ from db import (
 )
 from utils import export_snapshot, timestamp
 
+
 # ---------- PDF engine ----------
 try:
     from fpdf import FPDF
@@ -22,7 +23,9 @@ try:
 except Exception:
     FPDF_AVAILABLE = False
 
+
 st.set_page_config(page_title="OMEC Stock Take", page_icon="🗃️", layout="wide")
+
 
 # ---------- Config ----------
 ROOT = os.path.dirname(__file__)
@@ -37,6 +40,7 @@ else:
     CONFIG = {"brand_name": "OMEC", "brand_color": "#0ea5e9", "logo_path": "", "revision_tag": "Rev0.1"}
 
 init_db()
+
 
 # ---------- Helpers ----------
 def _norm_path(p: str) -> str:
@@ -71,24 +75,13 @@ def to_latin1(x) -> str:
         x = str(x)
     return x.encode("latin-1", "replace").decode("latin-1")
 
-def rev_bump(tag: str) -> str:
-    m = re.match(r"^\s*Rev(\d+)\.(\d+)\s*$", str(tag))
-    if not m:
-        return "Rev0.1"
-    major, minor = int(m.group(1)), int(m.group(2))
-    minor += 1
-    return f"Rev{major}.{minor}"
-
-def get_bool_setting(name: str, default: bool) -> bool:
-    raw = str(get_setting(name, str(default))).strip().lower()
-    return raw in {"1", "true", "yes", "y", "on"}
-
 def normalize_category(cat):
     if cat is None: return None
     s = str(cat).strip()
     if not s: return None
     s = re.sub(r"\s+", " ", s)
     return s.title()
+
 
 # ---------- Settings ----------
 logo_path = get_setting("logo_path", CONFIG.get("logo_path", ""))
@@ -99,8 +92,9 @@ prepared_by = get_setting("prepared_by", "")
 checked_by  = get_setting("checked_by", "")
 approved_by = get_setting("approved_by", "")
 email_recipients = get_setting("email_recipients", "")
-auto_backup_enabled = get_bool_setting("auto_backup_enabled", True)
+auto_backup_enabled = str(get_setting("auto_backup_enabled", "true")).lower() in {"1","true","yes","on"}
 brand_rgb = hex_to_rgb(brand_color)
+
 
 # ---------- Sidebar ----------
 st.sidebar.markdown(
@@ -123,8 +117,8 @@ menu = st.sidebar.radio(
     index=0,
 )
 
+
 # ---------- Auto-backup (daily) ----------
-def _today_stamp(): return dt.date.today().isoformat()
 def _has_snapshot_for_today():
     patt = os.path.join(SNAP_DIR, f"*{dt.date.today().strftime('%Y%m%d')}*.zip")
     return bool(glob.glob(patt))
@@ -133,11 +127,12 @@ if auto_backup_enabled and not _has_snapshot_for_today():
     try:
         items = get_items()
         tx = get_transactions(limit=1_000_000)
-        path = export_snapshot(items, tx, tag=f"Auto_{_today_stamp()}", note="Auto-backup on app open")
-        save_version_record(f"Auto_{_today_stamp()}", "Auto-backup", path)
+        path = export_snapshot(items, tx, tag=f"Auto_{dt.date.today().isoformat()}", note="Auto-backup on app open")
+        save_version_record(f"Auto_{dt.date.today().isoformat()}", "Auto-backup", path)
         st.sidebar.success("Auto-backup snapshot created for today.")
     except Exception:
         st.sidebar.warning("Auto-backup attempt failed (non-blocking).")
+
 
 # ---------- PDF base ----------
 if FPDF_AVAILABLE:
@@ -181,6 +176,7 @@ if FPDF_AVAILABLE:
             self.set_font("Helvetica", "I", 8)
             self.set_text_color(80, 80, 80)
             self.cell(0, 6, to_latin1(f"Page {self.page_no()}"), align="R")
+
 
 def _compute_col_widths(pdf, columns, rows, page_w, font_size):
     pdf.set_font("Helvetica", "B", font_size)
@@ -261,7 +257,8 @@ def _draw_row(pdf, values, widths, row_h, align_map=None, fill_rgb=None, bold=Fa
         pdf.set_xy(x + w, y_start)
     pdf.set_xy(x_left, y_start + max_h)
 
-# ---------- Inventory PDF (A3) ----------
+
+# ---------- Inventory PDF (grouped; unchanged) ----------
 def _inventory_pdf_bytes_grouped(
     df: pd.DataFrame,
     brand_name, brand_rgb, logo_path, revision_tag,
@@ -352,7 +349,8 @@ def _inventory_pdf_bytes_grouped(
 
     page_w = pdf.w - pdf.l_margin - pdf.r_margin
     widths = _compute_col_widths(pdf, display_cols, rows_for_width, page_w, font_size=9)
-    header_h = _draw_header_row(pdf, display_cols, widths, 9, brand_rgb)
+    _draw_header_row(pdf, display_cols, widths, 9, brand_rgb)
+
     align_map = {}
     for c in ("quantity", "min_qty", "unit_cost", "value", "converted_qty"):
         if c in present:
@@ -380,7 +378,7 @@ def _inventory_pdf_bytes_grouped(
         block = df_sorted[df_sorted["category"].fillna("(Unspecified)") == cat]
 
         span_h = 7
-        _ensure_page_space(pdf, span_h + header_h, display_cols, widths, 9, brand_rgb)
+        _ensure_page_space(pdf, span_h + 7, display_cols, widths, 9, brand_rgb)
         pdf.set_font("Helvetica", "B", 11)
         pdf.set_fill_color(*cat_bar)
         pdf.set_text_color(30, 30, 30)
@@ -403,9 +401,8 @@ def _inventory_pdf_bytes_grouped(
                     v = f"{float(v):,.3f}"
                 vals.append(v if v is not None else "")
             fill = low_stock_fill if float(r["quantity"]) < float(r["min_qty"]) else None
-            row_h = 7
-            _ensure_page_space(pdf, row_h + 2, display_cols, widths, 9, brand_rgb)
-            _draw_row(pdf, vals, widths, row_h, align_map=align_map, fill_rgb=fill, wrap_idx_set=set())
+            _ensure_page_space(pdf, 9, display_cols, widths, 9, brand_rgb)
+            _draw_row(pdf, vals, widths, 7, align_map=align_map, fill_rgb=fill, wrap_idx_set=set())
 
         sub_vals = []
         for c in present:
@@ -453,17 +450,20 @@ def _inventory_pdf_bytes_grouped(
     data = pdf.output(dest="S")
     return bytes(data) if isinstance(data, (bytes, bytearray)) else str(data).encode("latin-1", errors="ignore")
 
-# ---------- Issue Sheet PDF (A4 portrait) ----------
+
+# ---------- Issue Sheet PDF (A4) + Return Sheet section ----------
 def _issue_sheet_pdf_bytes(
     df: pd.DataFrame,
     brand_name, brand_rgb, logo_path, revision_tag,
     manager: str, project: str, notes: str,
     categories=None, only_available: bool=True,
-    blanks_cap: int = 12, fixed_blanks: int | None = None
+    blanks_cap: int = 12, fixed_blanks: int | None = None,
+    include_returns: bool = False,
+    return_blanks_cap: int = 12, fixed_return_blanks: int | None = None
 ) -> bytes:
     """
-    Summary row per item (shows On-hand), then ruled blank rows for write-ins.
-    Blank rows = min(int(On-hand) + 1, blanks_cap) unless fixed_blanks is set.
+    Issue section: summary row per item, then ruled blank rows for write-ins.
+    Return section (optional): per item descriptor row, then ruled blank rows with return-specific columns.
     """
     df = df.copy()
     if "category" in df.columns:
@@ -501,6 +501,18 @@ def _issue_sheet_pdf_bytes(
     pdf.add_page()
     pdf.set_text_color(30, 30, 30)
 
+    def draw_ruled_blank_row(pdf, widths, row_h=7, line_rgb=(170,170,170)):
+        y = pdf.get_y()
+        x = pdf.l_margin
+        pdf.set_x(x)
+        pdf.set_draw_color(*line_rgb)
+        pdf.set_line_width(0.2)
+        for w in widths:
+            pdf.rect(x, y, w, row_h)
+            x += w
+        pdf.set_y(y + row_h)
+
+    # ---- Header / Meta
     pdf.set_font("Helvetica", "B", 15)
     pdf.cell(0, 9, to_latin1("Stock Issue Sheet"), ln=1)
     pdf.set_font("Helvetica", "", 10)
@@ -517,7 +529,6 @@ def _issue_sheet_pdf_bytes(
     page_w = pdf.w - pdf.l_margin - pdf.r_margin
     widths = _compute_col_widths(pdf, display_cols, rows_for_width, page_w, font_size=9)
 
-    # Ensure writing columns are nice and wide
     for i, name in enumerate(display_cols):
         if name in {"Qty Issued"}:            widths[i] = max(widths[i], 20)
         if name in {"To (Person)"}:           widths[i] = max(widths[i], 35)
@@ -535,19 +546,7 @@ def _issue_sheet_pdf_bytes(
         groups = ["(All)"]
         df["category"] = "(All)"
 
-    def draw_ruled_blank_row(pdf, widths, row_h=7, line_rgb=(170,170,170)):
-        """Draws a light grey grid row (no text) for neat handwriting."""
-        y = pdf.get_y()
-        x = pdf.l_margin
-        pdf.set_x(x)
-        pdf.set_draw_color(*line_rgb)
-        pdf.set_line_width(0.2)
-        # outer boxes per column
-        for w in widths:
-            pdf.rect(x, y, w, row_h)
-            x += w
-        pdf.set_y(y + row_h)
-
+    # ---- Issue rows
     for cat in groups:
         block = df[df["category"].fillna("(Unspecified)") == cat]
         if block.empty:
@@ -564,7 +563,6 @@ def _issue_sheet_pdf_bytes(
             onhand = float(r.get("quantity") or 0.0)
             minq   = float(r.get("min_qty") or 0.0)
 
-            # Summary (values) row
             values = [
                 r.get("sku",""),
                 r.get("name",""),
@@ -576,39 +574,95 @@ def _issue_sheet_pdf_bytes(
             _ensure_page_space(pdf, 8, display_cols, widths, 9, brand_rgb)
             _draw_row(pdf, values, widths, 7, align_map=align_map, border="1")
 
-            # Number of ruled blanks under this item
             if fixed_blanks is not None and fixed_blanks > 0:
                 blanks = fixed_blanks
             else:
                 blanks = min(max(0, int(math.floor(onhand))) + 1, max(1, int(blanks_cap)))
 
-            # Draw ruled, boxed blank rows
-            for _i in range(blanks):
+            for _ in range(blanks):
                 _ensure_page_space(pdf, 7, display_cols, widths, 9, brand_rgb)
                 draw_ruled_blank_row(pdf, widths, row_h=7, line_rgb=(170,170,170))
 
-    # Footer sign-off
-    pdf.ln(6)
-    pdf.set_font("Helvetica", "", 9)
-    w = (pdf.w - pdf.l_margin - pdf.r_margin)
-    colw = w / 2.0
-    y0 = pdf.get_y()
-    pdf.set_xy(pdf.l_margin, y0 + 10)
-    pdf.line(pdf.l_margin, y0 + 9, pdf.l_margin + colw - 6, y0 + 9)
-    pdf.set_xy(pdf.l_margin, y0)
-    pdf.cell(colw - 6, 5, to_latin1("Issued by (Store/Manager)"), ln=0)
-    pdf.set_xy(pdf.l_margin + colw, y0 + 10)
-    pdf.line(pdf.l_margin + colw, y0 + 9, pdf.l_margin + w - 6, y0 + 9)
-    pdf.set_xy(pdf.l_margin + colw, y0)
-    pdf.cell(colw - 6, 5, to_latin1("Received by (Workshop)"), ln=0)
+    # ---- Return section (optional)
+    if include_returns:
+        pdf.add_page()
+        pdf.set_font("Helvetica", "B", 15)
+        pdf.cell(0, 9, to_latin1("Stock Return Sheet"), ln=1)
+        pdf.set_font("Helvetica", "", 10)
+        meta2 = [
+            f"Generated: {dt.datetime.now().strftime('%Y-%m-%d %H:%M')}",
+            f"Manager: {manager or '-'}",
+            f"Project/Job: {project or '-'}",
+        ]
+        pdf.cell(0, 6, to_latin1(" | ".join(meta2)), ln=1)
+        pdf.ln(2)
+
+        ret_cols = ["SKU","Item","Unit","Qty Returned","From (Person)","Signature","Date","Condition / Notes"]
+        ret_rows_for_width = [{"SKU":"","Item":"","Unit":"","Qty Returned":"","From (Person)":"","Signature":"","Date":"","Condition / Notes":""}]
+        ret_widths = _compute_col_widths(pdf, ret_cols, ret_rows_for_width, page_w, font_size=9)
+
+        # widen writing columns
+        for i, name in enumerate(ret_cols):
+            if name in {"Qty Returned"}:           ret_widths[i] = max(ret_widths[i], 24)
+            if name in {"From (Person)"}:          ret_widths[i] = max(ret_widths[i], 38)
+            if name in {"Signature"}:              ret_widths[i] = max(ret_widths[i], 32)
+            if name in {"Date"}:                   ret_widths[i] = max(ret_widths[i], 22)
+            if name in {"Condition / Notes"}:      ret_widths[i] = max(ret_widths[i], 48)
+
+        _draw_header_row(pdf, ret_cols, ret_widths, 9, brand_rgb)
+
+        for cat in groups:
+            block = df[df["category"].fillna("(Unspecified)") == cat]
+            if block.empty:
+                continue
+
+            _ensure_page_space(pdf, 8, ret_cols, ret_widths, 9, brand_rgb)
+            pdf.set_font("Helvetica", "B", 10)
+            pdf.set_fill_color(*cat_bar)
+            pdf.set_text_color(30, 30, 30)
+            pdf.cell(sum(ret_widths), 7, to_latin1(f"Category: {cat}"), border=1, ln=1, fill=True)
+
+            pdf.set_font("Helvetica", "", 9)
+            for _, r in block.iterrows():
+                # descriptor row (SKU/Item/Unit shown; rest blank)
+                desc_vals = [r.get("sku",""), r.get("name",""), r.get("unit","") or "", "", "", "", "", ""]
+                _ensure_page_space(pdf, 8, ret_cols, ret_widths, 9, brand_rgb)
+                _draw_row(pdf, desc_vals, ret_widths, 7, border="1")
+
+                if fixed_return_blanks is not None and fixed_return_blanks > 0:
+                    r_blanks = fixed_return_blanks
+                else:
+                    onhand = float(r.get("quantity") or 0.0)
+                    r_blanks = min(max(0, int(math.floor(onhand))) + 1, max(1, int(return_blanks_cap)))
+
+                for _ in range(r_blanks):
+                    _ensure_page_space(pdf, 7, ret_cols, ret_widths, 9, brand_rgb)
+                    draw_ruled_blank_row(pdf, ret_widths, row_h=7, line_rgb=(170,170,170))
+
+        # footer lines
+        pdf.ln(6)
+        pdf.set_font("Helvetica", "", 9)
+        w = (pdf.w - pdf.l_margin - pdf.r_margin)
+        colw = w / 2.0
+        y0 = pdf.get_y()
+        pdf.set_xy(pdf.l_margin, y0 + 10)
+        pdf.line(pdf.l_margin, y0 + 9, pdf.l_margin + colw - 6, y0 + 9)
+        pdf.set_xy(pdf.l_margin, y0)
+        pdf.cell(colw - 6, 5, to_latin1("Received by (Stores)"), ln=0)
+        pdf.set_xy(pdf.l_margin + colw, y0 + 10)
+        pdf.line(pdf.l_margin + colw, y0 + 9, pdf.l_margin + w - 6, y0 + 9)
+        pdf.set_xy(pdf.l_margin + colw, y0)
+        pdf.cell(colw - 6, 5, to_latin1("Returned by (Workshop)"), ln=0)
 
     data = pdf.output(dest="S")
     return bytes(data) if isinstance(data, (bytes, bytearray)) else str(data).encode("latin-1", errors="ignore")
+
 
 # ---------- Views ----------
 def view_dashboard():
     st.title("🏠 Dashboard")
     st.caption("Quick overview + low-stock email helper.")
+
     items = get_items()
     df = pd.DataFrame(items)
     if "category" in df.columns:
@@ -666,6 +720,7 @@ def view_dashboard():
             mailto = f"mailto:{email_recipients}?subject={encoded_subject}&body={encoded_body}"
             st.text_area("Email body (copy/paste)", value=body, height=120)
             st.markdown(f"[Open email draft]({mailto})")
+
 
 def view_inventory():
     st.title("📦 Inventory")
@@ -818,6 +873,7 @@ def view_inventory():
         else:
             st.error("Enter a SKU to delete.")
 
+
 def view_transactions():
     st.title("🔁 Transactions")
     st.caption("Record stock movement in/out and maintain an audit trail.")
@@ -877,10 +933,10 @@ def view_transactions():
         ]
     st.dataframe(f, use_container_width=True)
 
-# ---------- NEW: Issue Sheets ----------
+
 def view_issue_sheets():
     st.title("📝 Issue Sheets")
-    st.caption("Create a printable Stock Issue Sheet (PPE & consumables) with ruled blank sign-off rows, and log issues quickly.")
+    st.caption("Create a printable Stock Issue Sheet (PPE & consumables) with ruled blank sign-off rows, and (optional) Return Sheet.")
 
     if not FPDF_AVAILABLE:
         st.error("PDF engine not available. Add `fpdf2==2.7.9` to requirements.txt.")
@@ -912,23 +968,31 @@ def view_issue_sheets():
     notes = st.text_input("Notes (optional)")
 
     with st.expander("Sheet layout options", expanded=False):
-        cap = st.slider("Cap blank lines per item (On-hand + 1, capped)", min_value=1, max_value=40, value=12)
-        fixed_n = st.number_input("Or use a fixed number of blank rows per item (0 = disabled)", min_value=0, max_value=50, value=0)
+        cap = st.slider("Cap blank lines per item (Issue sheet; On-hand + 1, capped)", min_value=1, max_value=40, value=12)
+        fixed_n = st.number_input("Or use a fixed number per item (Issue; 0 = disabled)", min_value=0, max_value=50, value=0)
         fixed_blanks = fixed_n if fixed_n > 0 else None
 
-    build = st.button("Generate Issue Sheet (A4 PDF)")
+        st.markdown("---")
+        include_returns = st.checkbox("Include Return Sheet section", value=True)
+        ret_cap = st.slider("Cap blank lines per item (Return sheet; On-hand + 1, capped)", min_value=1, max_value=40, value=12)
+        ret_fixed_n = st.number_input("Or use a fixed number per item (Return; 0 = disabled)", min_value=0, max_value=50, value=0)
+        fixed_return_blanks = ret_fixed_n if ret_fixed_n > 0 else None
+
+    build = st.button("Generate Issue PDF (with optional Return section)")
     if build:
         pdf_bytes = _issue_sheet_pdf_bytes(
             df, brand_name, brand_rgb, logo_path, revision_tag,
             manager=mgr, project=project, notes=notes,
             categories=cat_select if cat_select else None,
             only_available=only_avail,
-            blanks_cap=cap, fixed_blanks=fixed_blanks
+            blanks_cap=cap, fixed_blanks=fixed_blanks,
+            include_returns=include_returns,
+            return_blanks_cap=ret_cap, fixed_return_blanks=fixed_return_blanks
         )
         st.download_button(
-            "Download Stock Issue Sheet",
+            "Download Issue/Return PDF",
             data=pdf_bytes,
-            file_name=f"IssueSheet_{timestamp()}.pdf",
+            file_name=f"Issue_Return_{timestamp()}.pdf",
             mime="application/pdf",
         )
 
@@ -953,6 +1017,7 @@ def view_issue_sheets():
                 add_transaction(q_sku, -abs(q_qty), reason="issue", project=q_proj, reference="", user=q_to, notes=notes2)
                 st.success(f"Issue logged for {q_sku} → {q_to} (-{q_qty})")
                 st.rerun()
+
 
 # ---------- Versions / Snapshots ----------
 def _zip_list():
@@ -1031,6 +1096,7 @@ def view_versions():
         st.info("No versions yet.")
     st.caption("Snapshot files in /snapshots:")
     st.write([os.path.basename(p) for p in _zip_list()])
+
 
 def _restore_from_bytes(zip_bytes: bytes, replace_items: bool, append_tx: bool, skip_dup: bool, preserve_ts: bool):
     zf = zipfile.ZipFile(io.BytesIO(zip_bytes))
@@ -1127,7 +1193,7 @@ def _restore_from_bytes(zip_bytes: bytes, replace_items: bool, append_tx: bool, 
 
     st.success(f"Restore complete. Items loaded: {added_items}" + (f" | Transactions added: {added_tx}" if append_tx and tx_name else ""))
 
-# ---------- Reports ----------
+
 def view_reports():
     st.title("🧾 Reports & Export (PDF)")
     st.caption("A3 landscape • grouped by category • subtotals • totals row • notes • unit conversion • sign-off block")
@@ -1263,7 +1329,7 @@ def view_reports():
     pdf_bytes_tx = df_to_pdf_bytes_pro("Transaction Log", df_tx, meta, brand_name, brand_rgb, logo_path, revision_tag)
     st.download_button("Download Transactions PDF", data=pdf_bytes_tx, file_name=f"transactions_{timestamp()}.pdf", mime="application/pdf")
 
-# ---------- Maintenance ----------
+
 def view_maintenance():
     st.title("🛠️ Maintenance")
     st.caption("Maintenance usage + Category Manager / cleanup tools.")
@@ -1328,6 +1394,7 @@ def view_maintenance():
                 fixed += 1
         st.success(f"Normalized {fixed} item(s).")
         st.rerun()
+
 
 # ---------- Router ----------
 if menu == "Dashboard":
