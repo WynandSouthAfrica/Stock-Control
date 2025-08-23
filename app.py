@@ -1,10 +1,10 @@
 # app.py — OMEC Stock Take (single-file)
-# A3 Landscape PDFs with:
+# PDFs (A3 Landscape) with:
 # - totals row (sum qty + total stock value)
 # - low-stock rows highlighted
 # - grouped by Category with subtotals
 # - header shows Revision tag (e.g., Rev0.1)
-# - tightened spacing between categories (no visible gaps)
+# - NO GAPS between item rows (precise row-height calc)
 # - Inventory report includes Notes column
 
 import os, json, math
@@ -116,17 +116,7 @@ if FPDF_AVAILABLE:
             self.set_text_color(80, 80, 80)
             self.cell(0, 6, f"Page {self.page_no()}", align="R")
 
-# ---------- PDF helpers (inventory grouped/subtotals/low-stock) ----------
-def _text_lines_needed(pdf, w, txt, line_h):
-    if txt is None:
-        return 1
-    s = str(txt)
-    if not s:
-        return 1
-    char_w = max(pdf.get_string_width("M"), 1e-6)
-    max_chars = max(int((w - 2) / (char_w if char_w else 1)), 1)
-    return max(1, math.ceil(len(s) / max(1, max_chars)))
-
+# ---------- PDF helpers (grouped inventory with exact heights) ----------
 def _compute_col_widths(pdf, columns, rows, page_w, font_size):
     pdf.set_font("Helvetica", "B", font_size)
     widths = []
@@ -169,34 +159,52 @@ def _ensure_page_space(pdf, needed_h, columns, widths, font_size, brand_rgb):
     pdf.add_page()
     _draw_header_row(pdf, columns, widths, font_size, brand_rgb)
 
-def _draw_row(pdf, values, widths, row_h, align_map=None, fill_rgb=None, bold=False, text_rgb=(15,15,15), border="1"):
-    """Draw one logical row made of multiple MultiCells with custom border string (e.g., 'LTR')."""
+def _calc_row_height_exact(pdf, values, widths, row_h, wrap_idx_set):
+    """Use fpdf2 split_only to match MultiCell wrapping exactly for wrap columns (e.g., Notes)."""
+    heights = []
+    for idx, (w, v) in enumerate(zip(widths, values)):
+        txt = "" if v is None else str(v)
+        if wrap_idx_set and (idx in wrap_idx_set):
+            try:
+                lines = pdf.multi_cell(w, row_h, txt, new_x="RIGHT", new_y="TOP", split_only=True)
+                n = max(1, len(lines))
+            except Exception:
+                # conservative fallback
+                n = max(1, math.ceil(pdf.get_string_width(txt) / max(1, (w - 2))))
+        else:
+            n = 1
+        heights.append(n * row_h)
+    return max(heights) if heights else row_h
+
+def _draw_row(pdf, values, widths, row_h, align_map=None, fill_rgb=None, bold=False, text_rgb=(15,15,15), wrap_idx_set=None, border="1"):
     if align_map is None:
         align_map = {}
+    if wrap_idx_set is None:
+        wrap_idx_set = set()
+
+    # exact height based on wrapped columns
+    max_h = _calc_row_height_exact(pdf, values, widths, row_h, wrap_idx_set)
+
     pdf.set_font("Helvetica", "B" if bold else "", 9)
     if fill_rgb:
         pdf.set_fill_color(*fill_rgb)
     pdf.set_text_color(*text_rgb)
 
     y_start = pdf.get_y()
-    heights = []
-    for w, v in zip(widths, values):
-        lines = _text_lines_needed(pdf, w, v, row_h)
-        heights.append(lines * row_h)
-    max_h = max(heights) if heights else row_h
-
     x_left = pdf.get_x()
+
     for idx, (w, v) in enumerate(zip(widths, values)):
         x = pdf.get_x()
         align = align_map.get(idx, "L")
+        txt = "" if v is None else str(v)
+        # draw with MultiCell; allow wrapping where needed
         if fill_rgb:
             pdf.set_fill_color(*fill_rgb)
-            pdf.multi_cell(w, row_h, str(v if v is not None else ""), border=border, align=align,
-                           new_x="RIGHT", new_y="TOP", fill=True)
-        else:
-            pdf.multi_cell(w, row_h, str(v if v is not None else ""), border=border, align=align,
-                           new_x="RIGHT", new_y="TOP")
+        pdf.multi_cell(w, row_h, txt, border=border, align=align,
+                       new_x="RIGHT", new_y="TOP", fill=bool(fill_rgb))
         pdf.set_xy(x + w, y_start)
+
+    # move to start of next row exactly
     pdf.set_xy(x_left, y_start + max_h)
 
 def _inventory_pdf_bytes_grouped(df: pd.DataFrame, brand_name, brand_rgb, logo_path, revision_tag) -> bytes:
@@ -256,6 +264,11 @@ def _inventory_pdf_bytes_grouped(df: pd.DataFrame, brand_name, brand_rgb, logo_p
     # Right alignment for numeric fields
     align_map = {present.index(c): "R" for c in present if c in ("quantity", "min_qty", "unit_cost", "value")}
 
+    # Index of wrapped column(s) (Notes)
+    wrap_idx_set = set()
+    if "notes" in present:
+        wrap_idx_set.add(display_cols.index("Notes"))
+
     # Grouping
     if "category" in df.columns:
         df_sorted = df.sort_values(by=["category", "sku", "name"], kind="stable")
@@ -275,20 +288,20 @@ def _inventory_pdf_bytes_grouped(df: pd.DataFrame, brand_name, brand_rgb, logo_p
     for cat in categories:
         block = df_sorted[df_sorted["category"].fillna("(Unspecified)") == cat]
 
-        # Category bar — draw WITHOUT bottom border so next row's top border touches (no gap)
+        # Category bar — FULL BORDER kept
         span_h = 7
         _ensure_page_space(pdf, span_h + header_h, display_cols, widths, 9, brand_rgb)
         pdf.set_font("Helvetica", "B", 11)
         pdf.set_fill_color(*cat_bar)
         pdf.set_text_color(30, 30, 30)
-        pdf.cell(sum(widths), span_h, f"Category: {cat}", border="LTR", ln=1, fill=True)
+        pdf.cell(sum(widths), span_h, f"Category: {cat}", border=1, ln=1, fill=True)
 
         cat_qty = float(block["quantity"].sum())
         cat_value = float((block["quantity"] * block["unit_cost"]).sum())
         grand_qty += cat_qty
         grand_value += cat_value
 
-        # Rows
+        # Rows (exact height, no gaps)
         for _, r in block.iterrows():
             vals = []
             for c in present:
@@ -301,21 +314,21 @@ def _inventory_pdf_bytes_grouped(df: pd.DataFrame, brand_name, brand_rgb, logo_p
             fill = low_stock_fill if float(r["quantity"]) < float(r["min_qty"]) else None
             row_h = 7
             _ensure_page_space(pdf, row_h + 2, display_cols, widths, 9, brand_rgb)
-            _draw_row(pdf, vals, widths, row_h, align_map=align_map, fill_rgb=fill)
+            _draw_row(pdf, vals, widths, row_h, align_map=align_map, fill_rgb=fill, wrap_idx_set=wrap_idx_set)
 
-        # Category subtotal — also remove bottom border so the NEXT category header touches it
+        # Category subtotal (full border, no extra spacing)
         sub_vals = []
         for c in present:
             if c == "sku":
                 sub_vals.append("Subtotal")
             elif c == "quantity":
-                sub_vals.append(fmt_num(cat_qty, 2))
+                sub_vals.append(f"{cat_qty:,.2f}")
             elif c == "value":
-                sub_vals.append(fmt_num(cat_value, 2))
+                sub_vals.append(f"{cat_value:,.2f}")
             else:
                 sub_vals.append("")
         _ensure_page_space(pdf, 7, display_cols, widths, 9, brand_rgb)
-        _draw_row(pdf, sub_vals, widths, 7, align_map=align_map, fill_rgb=light_brand, bold=True, border="LTR")
+        _draw_row(pdf, sub_vals, widths, 7, align_map=align_map, fill_rgb=light_brand, bold=True, wrap_idx_set=wrap_idx_set)
 
     # Grand total row
     total_vals = []
@@ -329,12 +342,12 @@ def _inventory_pdf_bytes_grouped(df: pd.DataFrame, brand_name, brand_rgb, logo_p
         else:
             total_vals.append("")
     _ensure_page_space(pdf, 8, display_cols, widths, 9, brand_rgb)
-    _draw_row(pdf, total_vals, widths, 8, align_map=align_map, fill_rgb=lighten(brand_rgb, 0.88), bold=True)
+    _draw_row(pdf, total_vals, widths, 8, align_map=align_map, fill_rgb=lighten(brand_rgb, 0.88), bold=True, wrap_idx_set=wrap_idx_set)
 
     data = pdf.output(dest="S")
     return bytes(data) if isinstance(data, (bytes, bytearray)) else str(data).encode("latin-1", errors="ignore")
 
-# Generic table (Transactions PDF)
+# ---------- Generic table (Transactions PDF) ----------
 def _text_lines_needed_table(pdf, w, txt, line_h):
     if not txt:
         return 1
