@@ -1,11 +1,12 @@
 # app.py — OMEC Stock Take (single-file)
-# Polished build + Manager filters:
+# Polished build + Manager filters + PDF latin-1 safety:
 # - Inventory filter + bulk edit
 # - Dashboard low-stock & category totals
 # - Reports: only-low-stock, sort-by, **category multi-select**, only-available
 # - Transactions filters
 # - Settings: Prepared-by + Rev++ button
 # - PDFs remain A3 landscape, grouped subtotals, totals row, Notes column, NO GAPS
+# - PDF text sanitized to latin-1 (fix FPDFUnicodeEncodingException)
 
 import os, json, math, re
 import streamlit as st
@@ -73,6 +74,14 @@ def rev_bump(tag: str) -> str:
     minor += 1
     return f"Rev{major}.{minor}"
 
+def to_latin1(x) -> str:
+    """Return a string that is safe for core PDF fonts (latin-1)."""
+    if x is None:
+        return ""
+    if not isinstance(x, str):
+        x = str(x)
+    return x.encode("latin-1", "replace").decode("latin-1")
+
 # ---------- Settings (with config defaults) ----------
 logo_path = get_setting("logo_path", CONFIG.get("logo_path", ""))
 brand_name = get_setting("brand_name", CONFIG.get("brand_name", "OMEC"))
@@ -126,10 +135,10 @@ if FPDF_AVAILABLE:
             self.set_xy(x, 4)
             self.set_text_color(25, 25, 25)
             self.set_font("Helvetica", "B", 12)
-            self.cell(0, 6, txt=self.brand_name, ln=0)
+            self.cell(0, 6, txt=to_latin1(self.brand_name), ln=0)
             self.set_xy(-80, 4)
             self.set_font("Helvetica", "", 9)
-            self.cell(70, 6, txt=f"Revision: {self.revision_tag}", ln=0, align="R")
+            self.cell(70, 6, txt=to_latin1(f"Revision: {self.revision_tag}"), ln=0, align="R")
             self.set_draw_color(*self.brand_rgb)
             self.set_line_width(0.4)
             self.line(8, 14, self.w - 8, 14)
@@ -143,16 +152,16 @@ if FPDF_AVAILABLE:
             self.set_y(-8)
             self.set_font("Helvetica", "I", 8)
             self.set_text_color(80, 80, 80)
-            self.cell(0, 6, f"Page {self.page_no()}", align="R")
+            self.cell(0, 6, to_latin1(f"Page {self.page_no()}"), align="R")
 
 def _compute_col_widths(pdf, columns, rows, page_w, font_size):
     pdf.set_font("Helvetica", "B", font_size)
     widths = []
     for c in columns:
-        max_w = pdf.get_string_width(str(c)) + 6
+        max_w = pdf.get_string_width(to_latin1(str(c))) + 6
         pdf.set_font("Helvetica", "", font_size)
         for r in rows[:200]:
-            w = pdf.get_string_width(str(r.get(c, ""))) + 6
+            w = pdf.get_string_width(to_latin1(str(r.get(c, "")))) + 6
             if w > max_w:
                 max_w = w
         max_w = max(18, min(max_w, 100))
@@ -176,7 +185,7 @@ def _draw_header_row(pdf, columns, widths, font_size, brand_rgb):
     y0 = pdf.get_y()
     for w, col in zip(widths, columns):
         x = pdf.get_x()
-        pdf.multi_cell(w, row_h, str(col), border=1, align="L", fill=True, new_x="RIGHT", new_y="TOP")
+        pdf.multi_cell(w, row_h, to_latin1(str(col)), border=1, align="L", fill=True, new_x="RIGHT", new_y="TOP")
         pdf.set_xy(x + w, y0)
     pdf.ln(row_h)
     return row_h
@@ -190,7 +199,7 @@ def _ensure_page_space(pdf, needed_h, columns, widths, font_size, brand_rgb):
 def _calc_row_height_exact(pdf, values, widths, row_h, wrap_idx_set):
     heights = []
     for idx, (w, v) in enumerate(zip(widths, values)):
-        txt = "" if v is None else str(v)
+        txt = "" if v is None else to_latin1(str(v))
         if wrap_idx_set and (idx in wrap_idx_set):
             try:
                 lines = pdf.multi_cell(w, row_h, txt, new_x="RIGHT", new_y="TOP", split_only=True)
@@ -217,7 +226,7 @@ def _draw_row(pdf, values, widths, row_h, align_map=None, fill_rgb=None, bold=Fa
     for idx, (w, v) in enumerate(zip(widths, values)):
         x = pdf.get_x()
         align = align_map.get(idx, "L")
-        txt = "" if v is None else str(v)
+        txt = "" if v is None else to_latin1(str(v))
         if fill_rgb:
             pdf.set_fill_color(*fill_rgb)
         pdf.multi_cell(w, row_h, txt, border=border, align=align, new_x="RIGHT", new_y="TOP", fill=bool(fill_rgb))
@@ -284,19 +293,20 @@ def _inventory_pdf_bytes_grouped(
     pdf.set_text_color(30, 30, 30)
 
     pdf.set_font("Helvetica", "B", 16)
-    pdf.cell(0, 10, "Inventory Report", ln=1)
+    pdf.cell(0, 10, to_latin1("Inventory Report"), ln=1)
     pdf.set_font("Helvetica", "", 10)
 
     meta = [f"Rows: {len(df)}"]
     if categories:
-        meta.append("Categories: " + ", ".join(categories))
+        meta.append("Categories: " + ", ".join([to_latin1(c) for c in categories]))
     if only_available:
         meta.append("Only available (>0 qty)")
     if only_low:
         meta.append("Low-stock only")
     if prepared_by:
         meta.append(f"Prepared by: {prepared_by}")
-    pdf.cell(0, 6, "  •  ".join(meta), ln=1)
+    meta_line = " | ".join([to_latin1(m) for m in meta])
+    pdf.cell(0, 6, meta_line, ln=1)
     pdf.ln(2)
 
     page_w = pdf.w - pdf.l_margin - pdf.r_margin
@@ -330,7 +340,7 @@ def _inventory_pdf_bytes_grouped(
         pdf.set_font("Helvetica", "B", 11)
         pdf.set_fill_color(*cat_bar)
         pdf.set_text_color(30, 30, 30)
-        pdf.cell(sum(widths), span_h, f"Category: {cat}", border=1, ln=1, fill=True)
+        pdf.cell(sum(widths), span_h, to_latin1(f"Category: {cat}"), border=1, ln=1, fill=True)
 
         cat_qty = float(block["quantity"].sum())
         cat_value = float((block["quantity"] * block["unit_cost"]).sum())
@@ -649,10 +659,10 @@ def view_reports():
         pdf.add_page()
         pdf.set_text_color(30, 30, 30)
         pdf.set_font("Helvetica", "B", 16)
-        pdf.cell(0, 10, txt=title, ln=1)
+        pdf.cell(0, 10, to_latin1(title), ln=1)
         pdf.set_font("Helvetica", "", 10)
         for line in meta_lines:
-            pdf.cell(0, 6, txt=str(line), ln=1)
+            pdf.cell(0, 6, to_latin1(str(line)), ln=1)
         pdf.ln(2)
 
         def draw_table(pdf, df: pd.DataFrame, header_fill_rgb: tuple, font_size=9):
@@ -661,10 +671,10 @@ def view_reports():
             measure_rows = min(len(df), 200)
             widths = []
             for col in df.columns:
-                max_w = pdf.get_string_width(str(col)) + 6
+                max_w = pdf.get_string_width(to_latin1(str(col))) + 6
                 pdf.set_font("Helvetica", "", font_size)
                 for i in range(measure_rows):
-                    w = pdf.get_string_width(str(df.iloc[i][col])) + 6
+                    w = pdf.get_string_width(to_latin1(str(df.iloc[i][col]))) + 6
                     if w > max_w:
                         max_w = w
                 max_w = max(18, min(max_w, 100))
@@ -686,7 +696,7 @@ def view_reports():
             y0 = pdf.get_y()
             for w, col in zip(widths, df.columns):
                 x = pdf.get_x()
-                pdf.multi_cell(w, row_h, str(col), border=1, align="L", fill=True, new_x="RIGHT", new_y="TOP")
+                pdf.multi_cell(w, row_h, to_latin1(str(col)), border=1, align="L", fill=True, new_x="RIGHT", new_y="TOP")
                 pdf.set_xy(x + w, y0)
             pdf.ln(row_h)
 
@@ -703,7 +713,7 @@ def view_reports():
                     y0 = pdf.get_y()
                     for w, col in zip(widths, df.columns):
                         x = pdf.get_x()
-                        pdf.multi_cell(w, row_h, str(col), border=1, align="L", fill=True, new_x="RIGHT", new_y="TOP")
+                        pdf.multi_cell(w, row_h, to_latin1(str(col)), border=1, align="L", fill=True, new_x="RIGHT", new_y="TOP")
                         pdf.set_xy(x + w, y0)
                     pdf.ln(row_h)
                     pdf.set_font("Helvetica", "", font_size)
@@ -712,7 +722,7 @@ def view_reports():
 
                 x_left = pdf.get_x()
                 for w, val in zip(widths, df.iloc[idx].tolist()):
-                    txt = str(val)
+                    txt = to_latin1(str(val))
                     x = pdf.get_x()
                     pdf.multi_cell(w, row_h, txt, border=1, align="L", new_x="RIGHT", new_y="TOP")
                     pdf.set_xy(x + w, y_start)
