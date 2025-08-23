@@ -1,13 +1,13 @@
 # app.py — OMEC Stock Take (single-file)
-# PDFs (A3 Landscape) with:
-# - totals row (sum qty + total stock value)
-# - low-stock rows highlighted
-# - grouped by Category with subtotals
-# - header shows Revision tag (e.g., Rev0.1)
-# - NO GAPS between item rows (precise row-height calc)
-# - Inventory report includes Notes column
+# Polished build:
+# - Inventory filter + bulk edit
+# - Dashboard low-stock & category totals
+# - Reports: only-low-stock + sort-by controls
+# - Transactions filters
+# - Settings: Prepared-by + Rev++ button
+# - PDFs remain A3 landscape, grouped subtotals, totals row, Notes column, NO GAPS
 
-import os, json, math
+import os, json, math, re
 import streamlit as st
 import pandas as pd
 
@@ -19,7 +19,7 @@ from db import (
 )
 from utils import export_snapshot, timestamp
 
-# PDF engine (fpdf2) — app still runs if missing
+# PDF engine
 try:
     from fpdf import FPDF
     FPDF_AVAILABLE = True
@@ -65,6 +65,44 @@ def lighten(rgb, factor=0.85):
     r, g, b = rgb
     return (int(r + (255 - r) * factor), int(g + (255 - g) * factor), int(b + (255 - b) * factor))
 
+def rev_bump(tag: str) -> str:
+    m = re.match(r"^\s*Rev(\d+)\.(\d+)\s*$", str(tag))
+    if not m:
+        return "Rev0.1"
+    major, minor = int(m.group(1)), int(m.group(2))
+    minor += 1
+    return f"Rev{major}.{minor}"
+
+# ---------- Settings (with config defaults) ----------
+logo_path = get_setting("logo_path", CONFIG.get("logo_path", ""))
+brand_name = get_setting("brand_name", CONFIG.get("brand_name", "OMEC"))
+brand_color = get_setting("brand_color", CONFIG.get("brand_color", "#0ea5e9"))
+revision_tag = get_setting("revision_tag", CONFIG.get("revision_tag", "Rev0.1"))
+prepared_by = get_setting("prepared_by", "")
+brand_rgb = hex_to_rgb(brand_color)
+
+# ---------- Sidebar ----------
+st.sidebar.markdown(
+    f"<h2 style='color:{brand_color}; margin-bottom:0'>{brand_name}</h2>",
+    unsafe_allow_html=True
+)
+safe_show_logo(logo_path)
+
+menu = st.sidebar.radio(
+    "Navigation",
+    [
+        "Dashboard",
+        "Inventory",
+        "Transactions",
+        "Versions & Snapshots",
+        "Reports & Export (PDF)",
+        "Maintenance",
+        "Settings",
+    ],
+    index=0,
+)
+
+# ---------- PDF classes & helpers ----------
 if FPDF_AVAILABLE:
     class BrandedPDF(FPDF):
         def __init__(self, brand_name: str, brand_rgb: tuple, logo_path: str = "", revision_tag: str = "Rev0.1", *args, **kwargs):
@@ -76,11 +114,8 @@ if FPDF_AVAILABLE:
             self.set_auto_page_break(auto=True, margin=12)
 
         def header(self):
-            # Brand bar
             self.set_fill_color(*lighten(self.brand_rgb, 0.75))
             self.rect(x=0, y=0, w=self.w, h=14, style="F")
-
-            # Logo
             x = 10
             if self.logo_path and os.path.exists(self.logo_path):
                 try:
@@ -88,19 +123,13 @@ if FPDF_AVAILABLE:
                     x += 26
                 except Exception:
                     pass
-
-            # Brand name
             self.set_xy(x, 4)
             self.set_text_color(25, 25, 25)
             self.set_font("Helvetica", "B", 12)
             self.cell(0, 6, txt=self.brand_name, ln=0)
-
-            # Revision on right
             self.set_xy(-80, 4)
             self.set_font("Helvetica", "", 9)
             self.cell(70, 6, txt=f"Revision: {self.revision_tag}", ln=0, align="R")
-
-            # Divider
             self.set_draw_color(*self.brand_rgb)
             self.set_line_width(0.4)
             self.line(8, 14, self.w - 8, 14)
@@ -116,7 +145,6 @@ if FPDF_AVAILABLE:
             self.set_text_color(80, 80, 80)
             self.cell(0, 6, f"Page {self.page_no()}", align="R")
 
-# ---------- PDF helpers (grouped inventory with exact heights) ----------
 def _compute_col_widths(pdf, columns, rows, page_w, font_size):
     pdf.set_font("Helvetica", "B", font_size)
     widths = []
@@ -160,7 +188,6 @@ def _ensure_page_space(pdf, needed_h, columns, widths, font_size, brand_rgb):
     _draw_header_row(pdf, columns, widths, font_size, brand_rgb)
 
 def _calc_row_height_exact(pdf, values, widths, row_h, wrap_idx_set):
-    """Use fpdf2 split_only to match MultiCell wrapping exactly for wrap columns (e.g., Notes)."""
     heights = []
     for idx, (w, v) in enumerate(zip(widths, values)):
         txt = "" if v is None else str(v)
@@ -169,8 +196,7 @@ def _calc_row_height_exact(pdf, values, widths, row_h, wrap_idx_set):
                 lines = pdf.multi_cell(w, row_h, txt, new_x="RIGHT", new_y="TOP", split_only=True)
                 n = max(1, len(lines))
             except Exception:
-                # conservative fallback
-                n = max(1, math.ceil(pdf.get_string_width(txt) / max(1, (w - 2))))
+                n = 1
         else:
             n = 1
         heights.append(n * row_h)
@@ -181,45 +207,43 @@ def _draw_row(pdf, values, widths, row_h, align_map=None, fill_rgb=None, bold=Fa
         align_map = {}
     if wrap_idx_set is None:
         wrap_idx_set = set()
-
-    # exact height based on wrapped columns
     max_h = _calc_row_height_exact(pdf, values, widths, row_h, wrap_idx_set)
-
     pdf.set_font("Helvetica", "B" if bold else "", 9)
     if fill_rgb:
         pdf.set_fill_color(*fill_rgb)
     pdf.set_text_color(*text_rgb)
-
     y_start = pdf.get_y()
     x_left = pdf.get_x()
-
     for idx, (w, v) in enumerate(zip(widths, values)):
         x = pdf.get_x()
         align = align_map.get(idx, "L")
         txt = "" if v is None else str(v)
-        # draw with MultiCell; allow wrapping where needed
         if fill_rgb:
             pdf.set_fill_color(*fill_rgb)
-        pdf.multi_cell(w, row_h, txt, border=border, align=align,
-                       new_x="RIGHT", new_y="TOP", fill=bool(fill_rgb))
+        pdf.multi_cell(w, row_h, txt, border=border, align=align, new_x="RIGHT", new_y="TOP", fill=bool(fill_rgb))
         pdf.set_xy(x + w, y_start)
-
-    # move to start of next row exactly
     pdf.set_xy(x_left, y_start + max_h)
 
-def _inventory_pdf_bytes_grouped(df: pd.DataFrame, brand_name, brand_rgb, logo_path, revision_tag) -> bytes:
+def _inventory_pdf_bytes_grouped(df: pd.DataFrame, brand_name, brand_rgb, logo_path, revision_tag, prepared_by: str, only_low: bool, sort_by: str) -> bytes:
     df = df.copy()
     df["quantity"] = pd.to_numeric(df.get("quantity"), errors="coerce").fillna(0.0)
     df["min_qty"] = pd.to_numeric(df.get("min_qty"), errors="coerce").fillna(0.0)
     df["unit_cost"] = pd.to_numeric(df.get("unit_cost"), errors="coerce").fillna(0.0)
     df["value"] = (df["quantity"] * df["unit_cost"]).round(2)
 
-    # Include Notes column
+    if only_low:
+        df = df[df["quantity"] < df["min_qty"]]
+
+    if sort_by in {"sku", "name", "category"} and sort_by in df.columns:
+        df = df.sort_values(by=[sort_by, "sku", "name"], kind="stable")
+
     key_cols = [
         "sku", "name", "category", "location", "unit",
         "quantity", "min_qty", "unit_cost", "value", "notes", "updated_at"
     ]
     present = [c for c in key_cols if c in df.columns]
+    if not present:
+        present = list(df.columns)
     df = df[present]
 
     col_names = {
@@ -229,7 +253,6 @@ def _inventory_pdf_bytes_grouped(df: pd.DataFrame, brand_name, brand_rgb, logo_p
         "notes": "Notes", "updated_at": "Updated"
     }
     display_cols = [col_names.get(c, c) for c in present]
-
     def fmt_num(x, places=2): return f"{x:,.{places}f}"
 
     rows_for_width = []
@@ -254,22 +277,20 @@ def _inventory_pdf_bytes_grouped(df: pd.DataFrame, brand_name, brand_rgb, logo_p
     pdf.set_font("Helvetica", "B", 16)
     pdf.cell(0, 10, "Inventory Report", ln=1)
     pdf.set_font("Helvetica", "", 10)
-    pdf.cell(0, 6, f"Rows: {len(df)}", ln=1)
+    meta = [f"Rows: {len(df)}"]
+    if prepared_by:
+        meta.append(f"Prepared by: {prepared_by}")
+    pdf.cell(0, 6, "  •  ".join(meta), ln=1)
     pdf.ln(2)
 
     page_w = pdf.w - pdf.l_margin - pdf.r_margin
     widths = _compute_col_widths(pdf, display_cols, rows_for_width, page_w, font_size=9)
     header_h = _draw_header_row(pdf, display_cols, widths, 9, brand_rgb)
-
-    # Right alignment for numeric fields
     align_map = {present.index(c): "R" for c in present if c in ("quantity", "min_qty", "unit_cost", "value")}
-
-    # Index of wrapped column(s) (Notes)
     wrap_idx_set = set()
     if "notes" in present:
         wrap_idx_set.add(display_cols.index("Notes"))
 
-    # Grouping
     if "category" in df.columns:
         df_sorted = df.sort_values(by=["category", "sku", "name"], kind="stable")
         categories = df_sorted["category"].fillna("(Unspecified)").unique().tolist()
@@ -288,7 +309,6 @@ def _inventory_pdf_bytes_grouped(df: pd.DataFrame, brand_name, brand_rgb, logo_p
     for cat in categories:
         block = df_sorted[df_sorted["category"].fillna("(Unspecified)") == cat]
 
-        # Category bar — FULL BORDER kept
         span_h = 7
         _ensure_page_space(pdf, span_h + header_h, display_cols, widths, 9, brand_rgb)
         pdf.set_font("Helvetica", "B", 11)
@@ -301,7 +321,6 @@ def _inventory_pdf_bytes_grouped(df: pd.DataFrame, brand_name, brand_rgb, logo_p
         grand_qty += cat_qty
         grand_value += cat_value
 
-        # Rows (exact height, no gaps)
         for _, r in block.iterrows():
             vals = []
             for c in present:
@@ -316,7 +335,6 @@ def _inventory_pdf_bytes_grouped(df: pd.DataFrame, brand_name, brand_rgb, logo_p
             _ensure_page_space(pdf, row_h + 2, display_cols, widths, 9, brand_rgb)
             _draw_row(pdf, vals, widths, row_h, align_map=align_map, fill_rgb=fill, wrap_idx_set=wrap_idx_set)
 
-        # Category subtotal (full border, no extra spacing)
         sub_vals = []
         for c in present:
             if c == "sku":
@@ -330,7 +348,6 @@ def _inventory_pdf_bytes_grouped(df: pd.DataFrame, brand_name, brand_rgb, logo_p
         _ensure_page_space(pdf, 7, display_cols, widths, 9, brand_rgb)
         _draw_row(pdf, sub_vals, widths, 7, align_map=align_map, fill_rgb=light_brand, bold=True, wrap_idx_set=wrap_idx_set)
 
-    # Grand total row
     total_vals = []
     for c in present:
         if c == "sku":
@@ -347,141 +364,12 @@ def _inventory_pdf_bytes_grouped(df: pd.DataFrame, brand_name, brand_rgb, logo_p
     data = pdf.output(dest="S")
     return bytes(data) if isinstance(data, (bytes, bytearray)) else str(data).encode("latin-1", errors="ignore")
 
-# ---------- Generic table (Transactions PDF) ----------
-def _text_lines_needed_table(pdf, w, txt, line_h):
-    if not txt:
-        return 1
-    char_w = max(pdf.get_string_width("M"), 1e-6)
-    max_chars = max(int((w - 2) / (char_w if char_w else 1)), 1)
-    return max(1, math.ceil(len(str(txt)) / max(1, max_chars)))
-
-def draw_table(pdf, df: pd.DataFrame, header_fill_rgb: tuple, col_order=None, col_rename=None, font_size=9):
-    if col_order is not None:
-        df = df.loc[:, [c for c in col_order if c in df.columns]]
-    if col_rename:
-        df = df.rename(columns=col_rename)
-
-    pdf.set_font("Helvetica", "B", font_size)
-    page_w = pdf.w - pdf.l_margin - pdf.r_margin
-    measure_rows = min(len(df), 200)
-
-    widths = []
-    for col in df.columns:
-        max_w = pdf.get_string_width(str(col)) + 6
-        pdf.set_font("Helvetica", "", font_size)
-        for i in range(measure_rows):
-            w = pdf.get_string_width(str(df.iloc[i][col])) + 6
-            if w > max_w:
-                max_w = w
-        max_w = max(18, min(max_w, 100))
-        widths.append(max_w)
-
-    total_w = sum(widths)
-    if total_w > page_w:
-        scale = page_w / total_w
-        widths = [w * scale for w in widths]
-    else:
-        extra = page_w - total_w
-        if extra > 0 and len(widths) > 0:
-            bump = extra / len(widths)
-            widths = [w + bump for w in widths]
-
-    pdf.set_font("Helvetica", "B", font_size)
-    pdf.set_fill_color(*lighten(header_fill_rgb, 0.85))
-    pdf.set_text_color(20, 20, 20)
-    row_h = 7
-    y0 = pdf.get_y()
-    for w, col in zip(widths, df.columns):
-        x = pdf.get_x()
-        pdf.multi_cell(w, row_h, str(col), border=1, align="L", fill=True, new_x="RIGHT", new_y="TOP")
-        pdf.set_xy(x + w, y0)
-    pdf.ln(row_h)
-
-    pdf.set_font("Helvetica", "", font_size)
-    pdf.set_text_color(15, 15, 15)
-    for idx in range(len(df)):
-        y_start = pdf.get_y()
-        heights = []
-        for w, val in zip(widths, df.iloc[idx].tolist()):
-            lines = _text_lines_needed_table(pdf, w, str(val), row_h)
-            heights.append(lines * row_h)
-        max_h = max(heights) if heights else row_h
-
-        if y_start + max_h > pdf.h - pdf.b_margin:
-            pdf.add_page()
-            pdf.set_font("Helvetica", "B", font_size)
-            pdf.set_fill_color(*lighten(header_fill_rgb, 0.85))
-            pdf.set_text_color(20, 20, 20)
-            y0 = pdf.get_y()
-            for w, col in zip(widths, df.columns):
-                x = pdf.get_x()
-                pdf.multi_cell(w, row_h, str(col), border=1, align="L", fill=True, new_x="RIGHT", new_y="TOP")
-                pdf.set_xy(x + w, y0)
-            pdf.ln(row_h)
-            pdf.set_font("Helvetica", "", font_size)
-            pdf.set_text_color(15, 15, 15)
-            y_start = pdf.get_y()
-
-        x_left = pdf.get_x()
-        for w, val in zip(widths, df.iloc[idx].tolist()):
-            txt = str(val)
-            x = pdf.get_x()
-            pdf.multi_cell(w, row_h, txt, border=1, align="L", new_x="RIGHT", new_y="TOP")
-            pdf.set_xy(x + w, y_start)
-        pdf.set_xy(x_left, y_start + max_h)
-
-def df_to_pdf_bytes_pro(title: str, df: pd.DataFrame, meta_lines, brand_name: str, brand_rgb: tuple, logo_path: str, revision_tag: str) -> bytes:
-    pdf = BrandedPDF(
-        brand_name=brand_name, brand_rgb=brand_rgb, logo_path=logo_path, revision_tag=revision_tag,
-        orientation="L", unit="mm", format="A3"
-    )
-    pdf.add_page()
-    pdf.set_text_color(30, 30, 30)
-    pdf.set_font("Helvetica", "B", 16)
-    pdf.cell(0, 10, txt=title, ln=1)
-    pdf.set_font("Helvetica", "", 10)
-    for line in meta_lines:
-        pdf.cell(0, 6, txt=str(line), ln=1)
-    pdf.ln(2)
-    draw_table(pdf, df, header_fill_rgb=brand_rgb, font_size=9)
-
-    data = pdf.output(dest="S")
-    return bytes(data) if isinstance(data, (bytes, bytearray)) else str(data).encode("latin-1", errors="ignore")
-
-# ---------- Settings (with config defaults) ----------
-logo_path = get_setting("logo_path", CONFIG.get("logo_path", ""))
-brand_name = get_setting("brand_name", CONFIG.get("brand_name", "OMEC"))
-brand_color = get_setting("brand_color", CONFIG.get("brand_color", "#0ea5e9"))
-revision_tag = get_setting("revision_tag", CONFIG.get("revision_tag", "Rev0.1"))
-brand_rgb = hex_to_rgb(brand_color)
-
-# ---------- Sidebar ----------
-st.sidebar.markdown(
-    f"<h2 style='color:{brand_color}; margin-bottom:0'>{brand_name}</h2>",
-    unsafe_allow_html=True
-)
-safe_show_logo(logo_path)
-
-menu = st.sidebar.radio(
-    "Navigation",
-    [
-        "Dashboard",
-        "Inventory",
-        "Transactions",
-        "Versions & Snapshots",
-        "Reports & Export (PDF)",
-        "Maintenance",
-        "Settings",
-    ],
-    index=0,
-)
-
 # ---------- Views ----------
 def view_dashboard():
     st.title("🏠 Dashboard")
     st.caption("Quick overview of your stock status.")
     items = get_items()
-    tx = get_transactions(limit=10)
+    df = pd.DataFrame(items)
 
     col1, col2, col3, col4 = st.columns(4)
     total_items = len(items)
@@ -494,15 +382,48 @@ def view_dashboard():
     col3.metric("Low-Stock Items", low_stock)
     col4.metric("Stock Value", f"R {total_value:,.2f}")
 
-    st.subheader("Recent Transactions")
-    if tx:
-        st.dataframe(pd.DataFrame(tx), use_container_width=True)
-    else:
-        st.info("No transactions yet.")
+    c1, c2 = st.columns(2)
+    with c1:
+        st.subheader("Low-stock items")
+        if df.empty:
+            st.info("No items yet.")
+        else:
+            low_df = df[df["quantity"] < df["min_qty"]].copy()
+            if low_df.empty:
+                st.success("Nothing low on stock 🎉")
+            else:
+                st.dataframe(low_df[["sku", "name", "category", "location", "quantity", "min_qty"]], use_container_width=True, height=260)
+
+    with c2:
+        st.subheader("Category totals")
+        if df.empty:
+            st.info("No data.")
+        else:
+            cg = df.groupby(df["category"].fillna("(Unspecified)")).agg(
+                qty=("quantity", "sum"),
+                value=("unit_cost", lambda s: float((df.loc[s.index, "quantity"] * df.loc[s.index, "unit_cost"]).sum()))
+            )
+            cg = cg.sort_index()
+            st.dataframe(cg, use_container_width=True, height=260)
 
 def view_inventory():
     st.title("📦 Inventory")
     st.caption("Add, edit, or delete items.")
+
+    # Quick filter
+    items = get_items()
+    df = pd.DataFrame(items)
+    filt = st.text_input("Filter (SKU/Name/Category/Location contains…)")
+    fdf = df.copy()
+    if filt:
+        f = filt.lower()
+        mask = (
+            fdf["sku"].astype(str).str.lower().str.contains(f) |
+            fdf["name"].astype(str).str.lower().str.contains(f) |
+            fdf["category"].astype(str).str.lower().str.contains(f) |
+            fdf["location"].astype(str).str.lower().str.contains(f)
+        )
+        fdf = fdf[mask]
 
     with st.form("add_item"):
         cols = st.columns(4)
@@ -538,24 +459,53 @@ def view_inventory():
             else:
                 st.error("SKU and Name are required.")
 
-    st.subheader("Inventory List")
-    items = get_items()
-    df = pd.DataFrame(items)
-    if not df.empty:
-        st.dataframe(df, use_container_width=True)
-        to_delete = st.text_input("Delete by SKU")
-        if st.button("Delete Item"):
-            if to_delete:
-                delete_item(to_delete.strip())
-                st.success(f"Deleted '{to_delete}'")
-            else:
-                st.error("Enter a SKU to delete.")
+    st.subheader("Inventory List (editable)")
+    if not fdf.empty:
+        show_cols = ["sku","name","category","location","unit","quantity","min_qty","unit_cost","notes","updated_at"]
+        show_cols = [c for c in show_cols if c in fdf.columns]
+        edited = st.data_editor(
+            fdf[show_cols],
+            use_container_width=True,
+            num_rows="dynamic",
+            key="inv_editor",
+            column_config={
+                "quantity": st.column_config.NumberColumn(format="%.3f"),
+                "min_qty": st.column_config.NumberColumn(format="%.3f"),
+                "unit_cost": st.column_config.NumberColumn(format="%.2f"),
+            }
+        )
+        if st.button("Save Edits (Upsert visible rows)"):
+            for _, r in edited.iterrows():
+                add_or_update_item({
+                    "sku": r.get("sku"),
+                    "name": r.get("name"),
+                    "category": r.get("category"),
+                    "location": r.get("location"),
+                    "unit": r.get("unit"),
+                    "quantity": float(r.get("quantity") or 0),
+                    "min_qty": float(r.get("min_qty") or 0),
+                    "unit_cost": float(r.get("unit_cost") or 0),
+                    "notes": r.get("notes"),
+                    "image_path": None,
+                })
+            st.success("Edits saved.")
     else:
         st.info("No items yet. Add your first item above.")
+
+    st.divider()
+    colA, colB = st.columns(2)
+    to_delete = colA.text_input("Delete by SKU")
+    if colB.button("Delete Item"):
+        if to_delete:
+            delete_item(to_delete.strip())
+            st.success(f"Deleted '{to_delete}'")
+        else:
+            st.error("Enter a SKU to delete.")
 
 def view_transactions():
     st.title("🔁 Transactions")
     st.caption("Record stock movement in/out and maintain an audit trail.")
+
     items = get_items()
     sku_list = [i["sku"] for i in items]
 
@@ -582,12 +532,33 @@ def view_transactions():
             else:
                 st.error("SKU and non-zero quantity are required.")
 
-    st.subheader("Recent Transactions")
-    tx = get_transactions(limit=500)
-    if tx:
-        st.dataframe(pd.DataFrame(tx), use_container_width=True)
-    else:
+    st.subheader("Transaction Log (filtered)")
+    tx = get_transactions(limit=100_000)
+    df_tx = pd.DataFrame(tx)
+    if df_tx.empty:
         st.info("No transactions yet.")
+        return
+
+    c1, c2, c3 = st.columns(3)
+    sku_filter = c1.multiselect("SKU filter", sorted(df_tx["sku"].unique().tolist()))
+    reason_filter = c2.multiselect("Reason filter", sorted(df_tx["reason"].unique().tolist()))
+    search = c3.text_input("Text search")
+
+    f = df_tx.copy()
+    if sku_filter:
+        f = f[f["sku"].isin(sku_filter)]
+    if reason_filter:
+        f = f[f["reason"].isin(reason_filter)]
+    if search:
+        s = search.lower()
+        f = f[
+            f["sku"].astype(str).str.lower().str.contains(s) |
+            f["project"].astype(str).str.lower().str.contains(s) |
+            f["reference"].astype(str).str.lower().str.contains(s) |
+            f["user"].astype(str).str.lower().str.contains(s) |
+            f["notes"].astype(str).str.lower().str.contains(s)
+        ]
+    st.dataframe(f, use_container_width=True)
 
 def view_versions():
     st.title("🕒 Versions & Snapshots")
@@ -619,13 +590,18 @@ def view_reports():
         st.error("PDF engine not available. Add `fpdf2==2.7.9` to requirements.txt.")
         return
 
-    # Inventory PDF
     st.subheader("Inventory Report")
     items = get_items()
     df_items = pd.DataFrame(items)
 
+    only_low = st.checkbox("Only low-stock rows", value=False)
+    sort_by = st.selectbox("Sort by", options=["category","sku","name"], index=0)
+
     if not df_items.empty:
-        pdf_bytes = _inventory_pdf_bytes_grouped(df_items, brand_name, brand_rgb, logo_path, revision_tag)
+        pdf_bytes = _inventory_pdf_bytes_grouped(
+            df_items, brand_name, brand_rgb, logo_path, revision_tag,
+            prepared_by=prepared_by, only_low=only_low, sort_by=sort_by
+        )
         st.download_button(
             "Download Inventory PDF",
             data=pdf_bytes,
@@ -635,32 +611,117 @@ def view_reports():
     else:
         st.info("No items to include in the report.")
 
-    # Transactions PDF (simple)
-    st.subheader("Transaction Log")
+    st.subheader("Transaction Log (PDF)")
     tx = get_transactions(limit=100_000)
     df_tx = pd.DataFrame(tx)
-
-    if not df_tx.empty:
-        col_order = ["ts", "sku", "qty_change", "reason", "project", "reference", "user", "notes"]
-        col_names = {
-            "ts": "Timestamp", "sku": "SKU", "qty_change": "Δ Qty", "reason": "Reason",
-            "project": "Project/Job", "reference": "Reference", "user": "User", "notes": "Notes",
-        }
-        df_tx = df_tx.loc[:, [c for c in col_order if c in df_tx.columns]].rename(columns=col_names)
-        pdf_bytes_tx = df_to_pdf_bytes_pro(
-            "Transaction Log",
-            df_tx,
-            [f"Rows: {len(df_tx)}"],
-            brand_name, brand_rgb, logo_path, revision_tag
-        )
-        st.download_button(
-            "Download Transactions PDF",
-            data=pdf_bytes_tx,
-            file_name=f"transactions_{timestamp()}.pdf",
-            mime="application/pdf",
-        )
-    else:
+    if df_tx.empty:
         st.info("No transactions to include in the report.")
+        return
+
+    # simple PDF table
+    def df_to_pdf_bytes_pro(title: str, df: pd.DataFrame, meta_lines, brand_name: str, brand_rgb: tuple, logo_path: str, revision_tag: str) -> bytes:
+        pdf = BrandedPDF(
+            brand_name=brand_name, brand_rgb=brand_rgb, logo_path=logo_path, revision_tag=revision_tag,
+            orientation="L", unit="mm", format="A3"
+        )
+        pdf.add_page()
+        pdf.set_text_color(30, 30, 30)
+        pdf.set_font("Helvetica", "B", 16)
+        pdf.cell(0, 10, txt=title, ln=1)
+        pdf.set_font("Helvetica", "", 10)
+        for line in meta_lines:
+            pdf.cell(0, 6, txt=str(line), ln=1)
+        pdf.ln(2)
+
+        # draw table
+        def draw_table(pdf, df: pd.DataFrame, header_fill_rgb: tuple, font_size=9):
+            pdf.set_font("Helvetica", "B", font_size)
+            page_w = pdf.w - pdf.l_margin - pdf.r_margin
+            measure_rows = min(len(df), 200)
+            widths = []
+            for col in df.columns:
+                max_w = pdf.get_string_width(str(col)) + 6
+                pdf.set_font("Helvetica", "", font_size)
+                for i in range(measure_rows):
+                    w = pdf.get_string_width(str(df.iloc[i][col])) + 6
+                    if w > max_w:
+                        max_w = w
+                max_w = max(18, min(max_w, 100))
+                widths.append(max_w)
+            total_w = sum(widths)
+            if total_w > page_w:
+                scale = page_w / total_w
+                widths = [w * scale for w in widths]
+            else:
+                extra = page_w - total_w
+                if extra > 0 and len(widths) > 0:
+                    bump = extra / len(widths)
+                    widths = [w + bump for w in widths]
+
+            pdf.set_font("Helvetica", "B", font_size)
+            pdf.set_fill_color(*lighten(header_fill_rgb, 0.85))
+            pdf.set_text_color(20, 20, 20)
+            row_h = 7
+            y0 = pdf.get_y()
+            for w, col in zip(widths, df.columns):
+                x = pdf.get_x()
+                pdf.multi_cell(w, row_h, str(col), border=1, align="L", fill=True, new_x="RIGHT", new_y="TOP")
+                pdf.set_xy(x + w, y0)
+            pdf.ln(row_h)
+
+            pdf.set_font("Helvetica", "", font_size)
+            pdf.set_text_color(15, 15, 15)
+            for idx in range(len(df)):
+                y_start = pdf.get_y()
+                heights = []
+                for w, val in zip(widths, df.iloc[idx].tolist()):
+                    lines = 1
+                    heights.append(lines * row_h)
+                max_h = max(heights) if heights else row_h
+
+                if y_start + max_h > pdf.h - pdf.b_margin:
+                    pdf.add_page()
+                    pdf.set_font("Helvetica", "B", font_size)
+                    pdf.set_fill_color(*lighten(header_fill_rgb, 0.85))
+                    pdf.set_text_color(20, 20, 20)
+                    y0 = pdf.get_y()
+                    for w, col in zip(widths, df.columns):
+                        x = pdf.get_x()
+                        pdf.multi_cell(w, row_h, str(col), border=1, align="L", fill=True, new_x="RIGHT", new_y="TOP")
+                        pdf.set_xy(x + w, y0)
+                    pdf.ln(row_h)
+                    pdf.set_font("Helvetica", "", font_size)
+                    pdf.set_text_color(15, 15, 15)
+                    y_start = pdf.get_y()
+
+                x_left = pdf.get_x()
+                for w, val in zip(widths, df.iloc[idx].tolist()):
+                    txt = str(val)
+                    x = pdf.get_x()
+                    pdf.multi_cell(w, row_h, txt, border=1, align="L", new_x="RIGHT", new_y="TOP")
+                    pdf.set_xy(x + w, y_start)
+                pdf.set_xy(x_left, y_start + max_h)
+
+        draw_table(pdf, df, brand_rgb, font_size=9)
+        data = pdf.output(dest="S")
+        return bytes(data) if isinstance(data, (bytes, bytearray)) else str(data).encode("latin-1", errors="ignore")
+
+    col_order = ["ts", "sku", "qty_change", "reason", "project", "reference", "user", "notes"]
+    col_names = {
+        "ts": "Timestamp", "sku": "SKU", "qty_change": "Δ Qty", "reason": "Reason",
+        "project": "Project/Job", "reference": "Reference", "user": "User", "notes": "Notes",
+    }
+    df_tx = df_tx.loc[:, [c for c in col_order if c in df_tx.columns]].rename(columns=col_names)
+    meta = [f"Rows: {len(df_tx)}"]
+    if prepared_by:
+        meta.append(f"Prepared by: {prepared_by}")
+    pdf_bytes_tx = df_to_pdf_bytes_pro("Transaction Log", df_tx, meta, brand_name, brand_rgb, logo_path, revision_tag)
+    st.download_button(
+        "Download Transactions PDF",
+        data=pdf_bytes_tx,
+        file_name=f"transactions_{timestamp()}.pdf",
+        mime="application/pdf",
+    )
 
 def view_maintenance():
     st.title("🛠️ Maintenance (Lightweight)")
@@ -697,12 +758,13 @@ def view_settings():
     current_color = get_setting("brand_color", CONFIG.get("brand_color", "#0ea5e9"))
     current_logo = get_setting("logo_path", CONFIG.get("logo_path", ""))
     current_rev  = get_setting("revision_tag", CONFIG.get("revision_tag", "Rev0.1"))
+    current_prepared = get_setting("prepared_by", "")
 
     col1, col2 = st.columns(2)
     brand_name_in = col1.text_input("Brand Name", value=current_brand)
     brand_color_in = col2.color_picker("Brand Color", value=current_color)
-
     rev = st.text_input("Revision tag to show on PDFs (e.g., Rev0.1)", value=current_rev)
+    prepared_by_in = st.text_input("Prepared by (appears on PDFs)", value=current_prepared)
 
     st.subheader("Logo")
     upload = st.file_uploader("Upload a PNG/JPG logo", type=["png", "jpg", "jpeg"])
@@ -719,12 +781,13 @@ def view_settings():
             f.write(upload.read())
         selected = "assets/logo_custom.png"
 
-    c1, c2, c3 = st.columns([1, 1, 1])
+    c1, c2, c3, c4 = st.columns(4)
     if c1.button("Save Settings"):
         upsert_setting("brand_name", brand_name_in)
         upsert_setting("brand_color", brand_color_in)
         upsert_setting("logo_path", selected)
         upsert_setting("revision_tag", rev)
+        upsert_setting("prepared_by", prepared_by_in)
         st.success("Settings saved. Refresh to apply.")
     if c2.button("Clear Logo"):
         upsert_setting("logo_path", "")
@@ -734,7 +797,11 @@ def view_settings():
         upsert_setting("brand_color", "#0ea5e9")
         upsert_setting("logo_path", "assets/logo_OMEC.png")
         upsert_setting("revision_tag", "Rev0.1")
+        upsert_setting("prepared_by", "")
         st.success("Default branding applied. Refresh to see it.")
+    if c4.button("Rev++"):
+        upsert_setting("revision_tag", rev_bump(rev))
+        st.success("Revision bumped. Refresh Reports to see it.")
 
 # ---------- Router ----------
 if menu == "Dashboard":
