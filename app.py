@@ -1,8 +1,8 @@
 # app.py — OMEC Stock Take (Streamlit)
 # Big update: site profiles (snapshot-based), robust restore, sign-off in PDFs,
-# auto-backup, low-stock email helper, unit conversions, strong editing UX.
+# auto-backup, low-stock email helper (fixed), unit conversions, strong editing UX.
 
-import os, json, re, io, zipfile, glob, datetime as dt
+import os, json, re, io, zipfile, glob, datetime as dt, urllib.parse
 import streamlit as st
 import pandas as pd
 
@@ -269,7 +269,7 @@ def _inventory_pdf_bytes_grouped(
     df["value"] = (df["quantity"] * df["unit_cost"]).round(2)
 
     if "convert_to" in df.columns and "convert_factor" in df.columns:
-        df["convert_factor"] = pd.to_numeric(df["convert_factor"], errors="coerce").fillna(0.0)
+        df["convert_factor"] = pd.to_numeric(df.get("convert_factor"), errors="coerce").fillna(0.0)
         df["converted_qty"] = (df["quantity"] * df["convert_factor"]).round(3)
     else:
         df["converted_qty"] = None
@@ -498,7 +498,9 @@ def view_dashboard():
             for _, r in low.iterrows():
                 body_lines.append(f"- {r.get('sku')} | {r.get('name')} | Qty {r.get('quantity')} < Min {r.get('min_qty')}")
             body = "\n".join(body_lines)
-            mailto = f"mailto:{email_recipients}?subject=Low-Stock%20Alert&body={body.replace(' ', '%20').replace('\\n','%0A')}"
+            encoded_subject = urllib.parse.quote("Low-Stock Alert")
+            encoded_body = urllib.parse.quote(body)
+            mailto = f"mailto:{email_recipients}?subject={encoded_subject}&body={encoded_body}"
             st.text_area("Email body (copy/paste)", value=body, height=120)
             st.markdown(f"[Open email draft]({mailto})")
 
@@ -563,7 +565,6 @@ def view_inventory():
 
     st.subheader("Inventory List (editable)")
     if not fdf.empty:
-        # Show conversion columns if present
         show_cols = ["sku","name","category","location","unit","quantity","min_qty","unit_cost",
                      "convert_to","convert_factor","notes","updated_at"]
         show_cols = [c for c in show_cols if c in fdf.columns]
