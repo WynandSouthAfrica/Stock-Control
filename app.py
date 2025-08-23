@@ -1,8 +1,8 @@
-# app.py — OMEC Stock Take (single-file)
-# Restore fix: accept inventory/items*.csv and transactions/trans*.csv in snapshot ZIP
-# (The rest of the app is the same feature set we built.)
+# app.py — OMEC Stock Take (Streamlit)
+# Big update: site profiles (snapshot-based), robust restore, sign-off in PDFs,
+# auto-backup, low-stock email helper, unit conversions, strong editing UX.
 
-import os, json, math, re, io, zipfile
+import os, json, re, io, zipfile, glob, datetime as dt
 import streamlit as st
 import pandas as pd
 
@@ -14,7 +14,7 @@ from db import (
 )
 from utils import export_snapshot, timestamp
 
-# PDF engine
+# ---------- PDF engine ----------
 try:
     from fpdf import FPDF
     FPDF_AVAILABLE = True
@@ -25,6 +25,9 @@ st.set_page_config(page_title="OMEC Stock Take", page_icon="🗃️", layout="wi
 
 # ---------- Config ----------
 ROOT = os.path.dirname(__file__)
+SNAP_DIR = os.path.join(ROOT, "snapshots")
+os.makedirs(SNAP_DIR, exist_ok=True)
+
 CONFIG_PATH = os.path.join(ROOT, "config.json")
 if os.path.exists(CONFIG_PATH):
     with open(CONFIG_PATH, "r") as f:
@@ -60,6 +63,13 @@ def lighten(rgb, factor=0.85):
     r, g, b = rgb
     return (int(r + (255 - r) * factor), int(g + (255 - g) * factor), int(b + (255 - b) * factor))
 
+def to_latin1(x) -> str:
+    if x is None:
+        return ""
+    if not isinstance(x, str):
+        x = str(x)
+    return x.encode("latin-1", "replace").decode("latin-1")
+
 def rev_bump(tag: str) -> str:
     m = re.match(r"^\s*Rev(\d+)\.(\d+)\s*$", str(tag))
     if not m:
@@ -68,19 +78,20 @@ def rev_bump(tag: str) -> str:
     minor += 1
     return f"Rev{major}.{minor}"
 
-def to_latin1(x) -> str:
-    if x is None:
-        return ""
-    if not isinstance(x, str):
-        x = str(x)
-    return x.encode("latin-1", "replace").decode("latin-1")
+def get_bool_setting(name: str, default: bool) -> bool:
+    raw = str(get_setting(name, str(default))).strip().lower()
+    return raw in {"1", "true", "yes", "y", "on"}
 
-# ---------- Settings ----------
+# ---------- Settings (with config defaults) ----------
 logo_path = get_setting("logo_path", CONFIG.get("logo_path", ""))
 brand_name = get_setting("brand_name", CONFIG.get("brand_name", "OMEC"))
 brand_color = get_setting("brand_color", CONFIG.get("brand_color", "#0ea5e9"))
 revision_tag = get_setting("revision_tag", CONFIG.get("revision_tag", "Rev0.1"))
 prepared_by = get_setting("prepared_by", "")
+checked_by  = get_setting("checked_by", "")
+approved_by = get_setting("approved_by", "")
+email_recipients = get_setting("email_recipients", "")  # comma-separated
+auto_backup_enabled = get_bool_setting("auto_backup_enabled", True)
 brand_rgb = hex_to_rgb(brand_color)
 
 # ---------- Sidebar ----------
@@ -99,12 +110,29 @@ menu = st.sidebar.radio(
         "Versions & Snapshots",
         "Reports & Export (PDF)",
         "Maintenance",
-        "Settings",
     ],
     index=0,
 )
 
-# ---------- PDF helpers ----------
+# ---------- Auto-backup (once per calendar day) ----------
+def _today_stamp():
+    return dt.date.today().isoformat()
+
+def _has_snapshot_for_today():
+    patt = os.path.join(SNAP_DIR, f"*{dt.date.today().strftime('%Y%m%d')}*.zip")
+    return bool(glob.glob(patt))
+
+if auto_backup_enabled and not _has_snapshot_for_today():
+    try:
+        items = get_items()
+        tx = get_transactions(limit=1_000_000)
+        path = export_snapshot(items, tx, tag=f"Auto_{_today_stamp()}", note="Auto-backup on app open")
+        save_version_record(f"Auto_{_today_stamp()}", "Auto-backup", path)
+        st.sidebar.success("Auto-backup snapshot created for today.")
+    except Exception:
+        st.sidebar.warning("Auto-backup attempt failed (non-blocking).")
+
+# ---------- PDF core ----------
 if FPDF_AVAILABLE:
     class BrandedPDF(FPDF):
         def __init__(self, brand_name: str, brand_rgb: tuple, logo_path: str = "", revision_tag: str = "Rev0.1", *args, **kwargs):
@@ -226,18 +254,25 @@ def _draw_row(pdf, values, widths, row_h, align_map=None, fill_rgb=None, bold=Fa
         pdf.set_xy(x + w, y_start)
     pdf.set_xy(x_left, y_start + max_h)
 
-# ---------- PDF Inventory ----------
+# ---------- Inventory PDF ----------
 def _inventory_pdf_bytes_grouped(
     df: pd.DataFrame,
     brand_name, brand_rgb, logo_path, revision_tag,
-    prepared_by: str, only_low: bool, sort_by: str,
-    categories=None, only_available: bool=False
+    prepared_by: str, checked_by: str, approved_by: str,
+    only_low: bool, sort_by: str, categories=None, only_available: bool=False
 ) -> bytes:
     df = df.copy()
+    # Unit conversion (optional columns: convert_to, convert_factor)
     df["quantity"] = pd.to_numeric(df.get("quantity"), errors="coerce").fillna(0.0)
     df["min_qty"] = pd.to_numeric(df.get("min_qty"), errors="coerce").fillna(0.0)
     df["unit_cost"] = pd.to_numeric(df.get("unit_cost"), errors="coerce").fillna(0.0)
     df["value"] = (df["quantity"] * df["unit_cost"]).round(2)
+
+    if "convert_to" in df.columns and "convert_factor" in df.columns:
+        df["convert_factor"] = pd.to_numeric(df["convert_factor"], errors="coerce").fillna(0.0)
+        df["converted_qty"] = (df["quantity"] * df["convert_factor"]).round(3)
+    else:
+        df["converted_qty"] = None
 
     if categories and "category" in df.columns:
         df = df[df["category"].isin(categories)]
@@ -251,7 +286,8 @@ def _inventory_pdf_bytes_grouped(
 
     key_cols = [
         "sku", "name", "category", "location", "unit",
-        "quantity", "min_qty", "unit_cost", "value", "notes", "updated_at"
+        "quantity", "min_qty", "unit_cost", "value",
+        "convert_to", "converted_qty", "notes", "updated_at"
     ]
     present = [c for c in key_cols if c in df.columns]
     if not present:
@@ -262,6 +298,7 @@ def _inventory_pdf_bytes_grouped(
         "sku": "SKU", "name": "Name", "category": "Category", "location": "Location",
         "unit": "Unit", "quantity": "Qty", "min_qty": "Min",
         "unit_cost": "Unit Cost (R)", "value": "Value (R)",
+        "convert_to": "Conv Unit", "converted_qty": "Conv Qty",
         "notes": "Notes", "updated_at": "Updated"
     }
     display_cols = [col_names.get(c, c) for c in present]
@@ -276,6 +313,8 @@ def _inventory_pdf_bytes_grouped(
                 v = fmt_num(float(v), 2)
             elif c in ("unit_cost", "value"):
                 v = fmt_num(float(v), 2)
+            elif c == "converted_qty" and pd.notna(v):
+                v = fmt_num(float(v), 3)
             row[col_names.get(c, c)] = "" if v is None else str(v)
         rows_for_width.append(row)
 
@@ -305,7 +344,10 @@ def _inventory_pdf_bytes_grouped(
     page_w = pdf.w - pdf.l_margin - pdf.r_margin
     widths = _compute_col_widths(pdf, display_cols, rows_for_width, page_w, font_size=9)
     header_h = _draw_header_row(pdf, display_cols, widths, 9, brand_rgb)
-    align_map = {present.index(c): "R" for c in present if c in ("quantity", "min_qty", "unit_cost", "value")}
+    align_map = {}
+    for c in ("quantity", "min_qty", "unit_cost", "value", "converted_qty"):
+        if c in present:
+            align_map[present.index(c)] = "R"
     wrap_idx_set = set()
     if "notes" in present:
         wrap_idx_set.add(display_cols.index("Notes"))
@@ -348,6 +390,8 @@ def _inventory_pdf_bytes_grouped(
                     v = fmt_num(float(v), 2)
                 elif c in ("unit_cost", "value"):
                     v = fmt_num(float(v), 2)
+                elif c == "converted_qty" and pd.notna(v):
+                    v = fmt_num(float(v), 3)
                 vals.append(v if v is not None else "")
             fill = low_stock_fill if float(r["quantity"]) < float(r["min_qty"]) else None
             row_h = 7
@@ -380,13 +424,31 @@ def _inventory_pdf_bytes_grouped(
     _ensure_page_space(pdf, 8, display_cols, widths, 9, brand_rgb)
     _draw_row(pdf, total_vals, widths, 8, align_map=align_map, fill_rgb=lighten(brand_rgb, 0.88), bold=True, wrap_idx_set=wrap_idx_set)
 
+    # Sign-off block
+    pdf.ln(6)
+    pdf.set_font("Helvetica", "B", 10)
+    pdf.cell(0, 6, to_latin1("Sign-off"), ln=1)
+    pdf.set_font("Helvetica", "", 9)
+    w = (pdf.w - pdf.l_margin - pdf.r_margin)
+    colw = w / 3.0
+    y0 = pdf.get_y()
+    for i, label in enumerate(["Prepared by", "Checked by", "Approved by"]):
+        x = pdf.l_margin + i * colw
+        pdf.set_xy(x, y0 + 10)
+        pdf.line(x, y0 + 9, x + colw - 6, y0 + 9)
+        name = [prepared_by, checked_by, approved_by][i]
+        pdf.set_xy(x, y0 + 11)
+        pdf.cell(colw - 6, 5, to_latin1(name or ""), ln=0)
+        pdf.set_xy(x, y0)
+        pdf.cell(colw - 6, 5, to_latin1(label), ln=0)
+
     data = pdf.output(dest="S")
     return bytes(data) if isinstance(data, (bytes, bytearray)) else str(data).encode("latin-1", errors="ignore")
 
 # ---------- Views ----------
 def view_dashboard():
     st.title("🏠 Dashboard")
-    st.caption("Quick overview of your stock status.")
+    st.caption("Quick overview of your stock status with low-stock email helper.")
     items = get_items()
     df = pd.DataFrame(items)
 
@@ -418,19 +480,36 @@ def view_dashboard():
         if df.empty:
             st.info("No data.")
         else:
-            cg = df.groupby(df["category"].fillna("(Unspecified)")).agg(
-                qty=("quantity", "sum"),
-                value=("unit_cost", lambda s: float((df.loc[s.index, "quantity"] * df.loc[s.index, "unit_cost"]).sum()))
-            )
-            cg = cg.sort_index()
+            qty = df.groupby(df["category"].fillna("(Unspecified)"))["quantity"].sum().rename("qty")
+            val = (df["quantity"] * df["unit_cost"]).groupby(df["category"].fillna("(Unspecified)")).sum().rename("value")
+            cg = pd.concat([qty, val], axis=1)
             st.dataframe(cg, use_container_width=True, height=260)
+
+    st.divider()
+    st.subheader("Low-stock email (quick draft)")
+    if df.empty:
+        st.info("Add inventory first.")
+    else:
+        low = df[df["quantity"] < df["min_qty"]].copy()
+        if low.empty:
+            st.info("No low stock to email.")
+        else:
+            body_lines = ["Low-stock report:", ""]
+            for _, r in low.iterrows():
+                body_lines.append(f"- {r.get('sku')} | {r.get('name')} | Qty {r.get('quantity')} < Min {r.get('min_qty')}")
+            body = "\n".join(body_lines)
+            mailto = f"mailto:{email_recipients}?subject=Low-Stock%20Alert&body={body.replace(' ', '%20').replace('\\n','%0A')}"
+            st.text_area("Email body (copy/paste)", value=body, height=120)
+            st.markdown(f"[Open email draft]({mailto})")
 
 def view_inventory():
     st.title("📦 Inventory")
-    st.caption("Add, edit, or delete items.")
+    st.caption("Add, edit, or delete items. Quick Edit helps fix mistakes (e.g., wrong category).")
 
     items = get_items()
     df = pd.DataFrame(items)
+
+    # Quick filter
     filt = st.text_input("Filter (SKU/Name/Category/Location contains…)")
     fdf = df.copy()
     if filt:
@@ -450,13 +529,16 @@ def view_inventory():
         category = cols[2].text_input("Category")
         location = cols[3].text_input("Location")
 
-        cols2 = st.columns(4)
+        cols2 = st.columns(5)
         unit = cols2[0].text_input("Unit (e.g., pcs, m, kg)")
         quantity = cols2[1].number_input("Quantity", value=0.0, step=1.0, format="%.3f")
         min_qty = cols2[2].number_input("Min Qty (alert level)", value=0.0, step=1.0, format="%.3f")
         unit_cost = cols2[3].number_input("Unit Cost (R)", value=0.0, step=1.0, format="%.2f")
+        notes = cols2[4].text_input("Notes")
 
-        notes = st.text_area("Notes")
+        cols3 = st.columns(2)
+        convert_to = cols3[0].text_input("Convert to (optional, e.g., m², m)")
+        convert_factor = cols3[1].number_input("Conversion factor (base→convert)", value=0.0, step=0.001, format="%.3f")
 
         submitted = st.form_submit_button("Save Item")
         if submitted:
@@ -471,6 +553,8 @@ def view_inventory():
                     "min_qty": float(min_qty),
                     "unit_cost": float(unit_cost),
                     "notes": notes.strip() if notes else None,
+                    "convert_to": convert_to.strip() if convert_to else None,
+                    "convert_factor": float(convert_factor or 0.0),
                     "image_path": None,
                 })
                 st.success(f"Saved item '{sku}'")
@@ -479,7 +563,9 @@ def view_inventory():
 
     st.subheader("Inventory List (editable)")
     if not fdf.empty:
-        show_cols = ["sku","name","category","location","unit","quantity","min_qty","unit_cost","notes","updated_at"]
+        # Show conversion columns if present
+        show_cols = ["sku","name","category","location","unit","quantity","min_qty","unit_cost",
+                     "convert_to","convert_factor","notes","updated_at"]
         show_cols = [c for c in show_cols if c in fdf.columns]
         edited = st.data_editor(
             fdf[show_cols],
@@ -490,6 +576,7 @@ def view_inventory():
                 "quantity": st.column_config.NumberColumn(format="%.3f"),
                 "min_qty": st.column_config.NumberColumn(format="%.3f"),
                 "unit_cost": st.column_config.NumberColumn(format="%.2f"),
+                "convert_factor": st.column_config.NumberColumn(format="%.3f"),
             }
         )
         if st.button("Save Edits (Upsert visible rows)"):
@@ -504,11 +591,53 @@ def view_inventory():
                     "min_qty": float(r.get("min_qty") or 0),
                     "unit_cost": float(r.get("unit_cost") or 0),
                     "notes": r.get("notes"),
+                    "convert_to": r.get("convert_to"),
+                    "convert_factor": float(r.get("convert_factor") or 0),
                     "image_path": None,
                 })
             st.success("Edits saved.")
     else:
         st.info("No items yet. Add your first item above.")
+
+    st.divider()
+    st.subheader("Quick Edit (fix a captured mistake)")
+    if not df.empty:
+        sku_pick = st.selectbox("Select SKU to edit", options=sorted(df["sku"].tolist()))
+        rec = df[df["sku"] == sku_pick].iloc[0]
+        with st.form("quick_edit"):
+            cols = st.columns(4)
+            q_name = cols[0].text_input("Name", value=rec.get("name",""))
+            q_cat  = cols[1].text_input("Category", value=str(rec.get("category") or ""))
+            q_loc  = cols[2].text_input("Location", value=str(rec.get("location") or ""))
+            q_unit = cols[3].text_input("Unit", value=str(rec.get("unit") or ""))
+
+            cols2 = st.columns(4)
+            q_qty  = cols2[0].number_input("Quantity", value=float(rec.get("quantity") or 0.0), step=1.0, format="%.3f")
+            q_min  = cols2[1].number_input("Min Qty", value=float(rec.get("min_qty") or 0.0), step=1.0, format="%.3f")
+            q_cost = cols2[2].number_input("Unit Cost (R)", value=float(rec.get("unit_cost") or 0.0), step=1.0, format="%.2f")
+            q_notes= cols2[3].text_input("Notes", value=str(rec.get("notes") or ""))
+
+            cols3 = st.columns(2)
+            q_conv_to = cols3[0].text_input("Convert to", value=str(rec.get("convert_to") or ""))
+            q_conv_fac= cols3[1].number_input("Conversion factor", value=float(rec.get("convert_factor") or 0.0), step=0.001, format="%.3f")
+
+            submit = st.form_submit_button("Apply Changes")
+            if submit:
+                add_or_update_item({
+                    "sku": sku_pick,
+                    "name": q_name,
+                    "category": q_cat or None,
+                    "location": q_loc or None,
+                    "unit": q_unit or None,
+                    "quantity": float(q_qty),
+                    "min_qty": float(q_min),
+                    "unit_cost": float(q_cost),
+                    "notes": q_notes or None,
+                    "convert_to": q_conv_to or None,
+                    "convert_factor": float(q_conv_fac or 0.0),
+                    "image_path": None,
+                })
+                st.success("Item updated.")
 
     st.divider()
     colA, colB = st.columns(2)
@@ -578,14 +707,27 @@ def view_transactions():
         ]
     st.dataframe(f, use_container_width=True)
 
+def _zip_list():
+    return sorted(glob.glob(os.path.join(SNAP_DIR, "*.zip")), reverse=True)
+
+def _find_latest_for_site(site: str):
+    pats = [
+        os.path.join(SNAP_DIR, f"*{site}*.zip"),
+        os.path.join(SNAP_DIR, f"*{site.replace(' ', '_')}*.zip"),
+    ]
+    files = []
+    for p in pats:
+        files += glob.glob(p)
+    files = sorted(files, reverse=True)
+    return files[0] if files else None
+
 def view_versions():
     st.title("🕒 Versions & Snapshots")
-    st.caption("Create timestamped ZIP archives of your data for traceability. You can also restore from a snapshot.")
+    st.caption("Create timestamped ZIP archives of your data for traceability. Also supports restore and site profiles.")
 
     # --- Create snapshot ---
     tag = st.text_input("Version tag (e.g., V0.1, 'after_stock_count')")
     note = st.text_area("Note")
-
     if st.button("Create Snapshot ZIP"):
         items = get_items()
         tx = get_transactions(limit=1_000_000)
@@ -595,119 +737,153 @@ def view_versions():
         with open(zip_path, "rb") as f:
             st.download_button("Download ZIP", data=f.read(), file_name=os.path.basename(zip_path))
 
-    # --- Restore snapshot ---
+    st.divider()
+    st.subheader("Site Profiles (snapshot-based)")
+    cols = st.columns(3)
+    site = cols[0].text_input("Site name", value="Main Workshop")
+    if cols[1].button("Create snapshot for site"):
+        items = get_items()
+        tx = get_transactions(limit=1_000_000)
+        site_tag = f"{site.replace(' ', '_')}_{timestamp()}"
+        zip_path = export_snapshot(items, tx, tag=site_tag, note=f"Site: {site}")
+        save_version_record(site_tag, f"Site {site}", zip_path)
+        st.success(f"Snapshot for '{site}' saved: {os.path.basename(zip_path)}")
+    if cols[2].button("Restore latest for site"):
+        latest = _find_latest_for_site(site)
+        if not latest:
+            st.error("No snapshot found for that site name.")
+        else:
+            try:
+                with open(latest, "rb") as f:
+                    data = f.read()
+                _restore_from_bytes(data, replace_items=True, append_tx=True, skip_dup=True, preserve_ts=True)
+            except Exception as e:
+                st.error(f"Restore failed: {e}")
+
     st.divider()
     st.subheader("Restore from Snapshot ZIP")
-    st.caption("Use this to rebuild your DB from a previously saved ZIP (e.g., after a rebuild or when switching sites).")
+    st.caption("Rebuild DB from a saved ZIP (e.g., after rebuild or when switching sites).")
     up = st.file_uploader("Upload snapshot ZIP", type=["zip"])
-    colr1, colr2, colr3 = st.columns(3)
+    colr1, colr2, colr3, colr4 = st.columns(4)
     replace_items = colr1.checkbox("Replace items (clear & load)", value=True)
     append_tx = colr2.checkbox("Append transactions", value=False)
     skip_dup = colr3.checkbox("Skip duplicate transactions", value=True)
+    preserve_ts = colr4.checkbox("Try to keep original tx timestamps", value=True)
 
     if up and st.button("Restore now"):
         try:
-            zf = zipfile.ZipFile(io.BytesIO(up.read()))
-            all_names = zf.namelist()
-
-            # Flexible finders
-            def find_csv(candidates):
-                for n in all_names:
-                    ln = n.lower()
-                    if ln.endswith(".csv") and any(k in ln for k in candidates):
-                        return n
-                return None
-
-            inv_name = find_csv(["inventory", "items"])
-            tx_name  = find_csv(["transactions", "transaction", "trans"])
-
-            if not inv_name:
-                st.error("inventory.csv (or items*.csv) not found in ZIP.\n\nFiles in ZIP:\n" + "\n".join(all_names))
-                return
-
-            # Load inventory CSV
-            inv_df = pd.read_csv(io.BytesIO(zf.read(inv_name)))
-
-            if replace_items:
-                existing = get_items()
-                for it in existing:
-                    try:
-                        delete_item(it["sku"])
-                    except Exception:
-                        pass
-
-            added_items = 0
-            for _, r in inv_df.iterrows():
-                try:
-                    add_or_update_item({
-                        "sku": str(r.get("sku") or "").strip(),
-                        "name": str(r.get("name") or "").strip(),
-                        "category": (r.get("category") if pd.notna(r.get("category")) else None),
-                        "location": (r.get("location") if pd.notna(r.get("location")) else None),
-                        "unit": (r.get("unit") if pd.notna(r.get("unit")) else None),
-                        "quantity": float(r.get("quantity") or 0),
-                        "min_qty": float(r.get("min_qty") or 0),
-                        "unit_cost": float(r.get("unit_cost") or 0),
-                        "notes": (r.get("notes") if pd.notna(r.get("notes")) else None),
-                        "image_path": None,
-                    })
-                    added_items += 1
-                except Exception as e:
-                    st.warning(f"Item restore skipped for SKU={r.get('sku')}: {e}")
-
-            added_tx = 0
-            if append_tx and tx_name:
-                tx_df = pd.read_csv(io.BytesIO(zf.read(tx_name)))
-                existing_tx = get_transactions(limit=1_000_000) if skip_dup else []
-                existing_keys = set()
-                if skip_dup:
-                    for t in existing_tx:
-                        key = (
-                            str(t.get("sku") or ""),
-                            float(t.get("qty_change") or 0.0),
-                            str(t.get("reason") or ""),
-                            str(t.get("project") or ""),
-                            str(t.get("reference") or ""),
-                            str(t.get("user") or ""),
-                            str(t.get("notes") or ""),
-                        )
-                        existing_keys.add(key)
-
-                for _, r in tx_df.iterrows():
-                    key = (
-                        str(r.get("sku") or ""),
-                        float(r.get("qty_change") or 0.0),
-                        str(r.get("reason") or ""),
-                        str(r.get("project") or ""),
-                        str(r.get("reference") or ""),
-                        str(r.get("user") or ""),
-                        str(r.get("notes") or ""),
-                    )
-                    if skip_dup and key in existing_keys:
-                        continue
-                    try:
-                        add_transaction(
-                            key[0], key[1], key[2], key[3], key[4], key[5], key[6]
-                        )
-                        added_tx += 1
-                    except Exception as e:
-                        st.warning(f"Transaction restore skipped for SKU={key[0]}: {e}")
-
-            st.success(f"Restore complete. Items loaded: {added_items}" + (f" | Transactions added: {added_tx}" if append_tx and tx_name else ""))
-            st.info("Tip: Save a new snapshot after restoring and updating.")
+            _restore_from_bytes(up.read(), replace_items, append_tx, skip_dup, preserve_ts)
         except Exception as e:
             st.error(f"Restore failed: {e}")
 
     st.subheader("History")
     versions = get_versions()
     if versions:
-        st.dataframe(pd.DataFrame(versions), use_container_width=True)
+        st.dataframe(pd.DataFrame(versions), use_container_width=True, height=300)
     else:
         st.info("No versions yet.")
+    st.caption("Snapshot files in /snapshots:")
+    st.write([os.path.basename(p) for p in _zip_list()])
+
+def _restore_from_bytes(zip_bytes: bytes, replace_items: bool, append_tx: bool, skip_dup: bool, preserve_ts: bool):
+    zf = zipfile.ZipFile(io.BytesIO(zip_bytes))
+    all_names = zf.namelist()
+
+    def find_csv(candidates):
+        for n in all_names:
+            ln = n.lower()
+            if ln.endswith(".csv") and any(k in ln for k in candidates):
+                return n
+        return None
+
+    inv_name = find_csv(["inventory", "items"])
+    tx_name  = find_csv(["transactions", "transaction", "trans"])
+
+    if not inv_name:
+        st.error("inventory.csv (or items*.csv) not found in ZIP.\n\nFiles:\n" + "\n".join(all_names))
+        return
+
+    inv_df = pd.read_csv(io.BytesIO(zf.read(inv_name)))
+
+    if replace_items:
+        existing = get_items()
+        for it in existing:
+            try:
+                delete_item(it["sku"])
+            except Exception:
+                pass
+
+    added_items = 0
+    for _, r in inv_df.iterrows():
+        try:
+            add_or_update_item({
+                "sku": str(r.get("sku") or "").strip(),
+                "name": str(r.get("name") or "").strip(),
+                "category": (r.get("category") if pd.notna(r.get("category")) else None),
+                "location": (r.get("location") if pd.notna(r.get("location")) else None),
+                "unit": (r.get("unit") if pd.notna(r.get("unit")) else None),
+                "quantity": float(r.get("quantity") or 0),
+                "min_qty": float(r.get("min_qty") or 0),
+                "unit_cost": float(r.get("unit_cost") or 0),
+                "notes": (r.get("notes") if pd.notna(r.get("notes")) else None),
+                "convert_to": (r.get("convert_to") if "convert_to" in inv_df.columns and pd.notna(r.get("convert_to")) else None),
+                "convert_factor": float(r.get("convert_factor") or 0) if "convert_factor" in inv_df.columns else 0.0,
+                "image_path": None,
+            })
+            added_items += 1
+        except Exception as e:
+            st.warning(f"Item restore skipped for SKU={r.get('sku')}: {e}")
+
+    added_tx = 0
+    if append_tx and tx_name:
+        tx_df = pd.read_csv(io.BytesIO(zf.read(tx_name)))
+        existing_tx = get_transactions(limit=1_000_000) if skip_dup else []
+        existing_keys = set()
+        if skip_dup:
+            for t in existing_tx:
+                key = (
+                    str(t.get("sku") or ""),
+                    float(t.get("qty_change") or 0.0),
+                    str(t.get("reason") or ""),
+                    str(t.get("project") or ""),
+                    str(t.get("reference") or ""),
+                    str(t.get("user") or ""),
+                    str(t.get("notes") or ""),
+                    to_latin1(str(t.get("ts") or "")),
+                )
+                existing_keys.add(key)
+
+        for _, r in tx_df.iterrows():
+            key = (
+                str(r.get("sku") or ""),
+                float(r.get("qty_change") or 0.0),
+                str(r.get("reason") or ""),
+                str(r.get("project") or ""),
+                str(r.get("reference") or ""),
+                str(r.get("user") or ""),
+                str(r.get("notes") or ""),
+                to_latin1(str(r.get("ts") or "")),
+            )
+            if skip_dup and key in existing_keys:
+                continue
+            try:
+                # Try preserving timestamp if DB supports it
+                if preserve_ts:
+                    try:
+                        add_transaction(key[0], key[1], key[2], key[3], key[4], key[5], key[6], ts=key[7])
+                    except TypeError:
+                        add_transaction(key[0], key[1], key[2], key[3], key[4], key[5], key[6])
+                else:
+                    add_transaction(key[0], key[1], key[2], key[3], key[4], key[5], key[6])
+                added_tx += 1
+            except Exception as e:
+                st.warning(f"Transaction restore skipped for SKU={key[0]}: {e}")
+
+    st.success(f"Restore complete. Items loaded: {added_items}" + (f" | Transactions added: {added_tx}" if append_tx and tx_name else ""))
 
 def view_reports():
     st.title("🧾 Reports & Export (PDF)")
-    st.caption("A3 landscape • grouped by category • subtotals • low-stock highlight • totals row • Notes column")
+    st.caption("A3 landscape • grouped by category • subtotals • totals row • notes • unit conversion • sign-off block")
 
     if not FPDF_AVAILABLE:
         st.error("PDF engine not available. Add `fpdf2==2.7.9` to requirements.txt.")
@@ -727,8 +903,8 @@ def view_reports():
         use_cats = cat_select if cat_select else None
         pdf_bytes = _inventory_pdf_bytes_grouped(
             df_items, brand_name, brand_rgb, logo_path, revision_tag,
-            prepared_by=prepared_by, only_low=only_low, sort_by=sort_by,
-            categories=use_cats, only_available=only_available
+            prepared_by=prepared_by, checked_by=checked_by, approved_by=approved_by,
+            only_low=only_low, sort_by=sort_by, categories=use_cats, only_available=only_available
         )
         st.download_button(
             "Download Inventory PDF",
@@ -799,8 +975,7 @@ def view_reports():
             pdf.set_text_color(15, 15, 15)
             for idx in range(len(df)):
                 y_start = pdf.get_y()
-                max_h = row_h
-                if y_start + max_h > pdf.h - pdf.b_margin:
+                if y_start + row_h > pdf.h - pdf.b_margin:
                     pdf.add_page()
                     pdf.set_font("Helvetica", "B", font_size)
                     pdf.set_fill_color(*lighten(header_fill_rgb, 0.85))
@@ -828,8 +1003,10 @@ def view_reports():
         return bytes(data) if isinstance(data, (bytes, bytearray)) else str(data).encode("latin-1", errors="ignore")
 
     col_order = ["ts", "sku", "qty_change", "reason", "project", "reference", "user", "notes"]
-    col_names = {"ts":"Timestamp","sku":"SKU","qty_change":"Δ Qty","reason":"Reason","project":"Project/Job","reference":"Reference","user":"User","notes":"Notes"}
-    df_tx = pd.DataFrame(tx)
+    col_names = {
+        "ts":"Timestamp","sku":"SKU","qty_change":"Δ Qty","reason":"Reason",
+        "project":"Project/Job","reference":"Reference","user":"User","notes":"Notes"
+    }
     df_tx = df_tx.loc[:, [c for c in col_order if c in df_tx.columns]].rename(columns=col_names)
     meta = [f"Rows: {len(df_tx)}"]
     if prepared_by:
@@ -850,7 +1027,7 @@ def view_maintenance():
         cols = st.columns(4)
         sku = cols[0].selectbox("Item SKU", options=sku_list)
         qty_used = cols[1].number_input("Qty Used (negative)", value=-1.0, step=1.0, format="%.3f")
-        project = cols[2].text_input("Home/Workshop area (e.g., Bathroom Reno)")
+        project = cols[2].text_input("Home/Workshop area")
         user = cols[3].text_input("Person")
         notes = st.text_area("Notes (what/where/why)")
 
@@ -861,59 +1038,6 @@ def view_maintenance():
             else:
                 add_transaction(sku, qty_used, reason="maintenance", project=project, reference="", user=user, notes=notes)
                 st.success("Maintenance usage logged (stock deducted).")
-
-def view_settings():
-    st.title("⚙️ Settings")
-    st.caption("Branding and display options.")
-
-    current_brand = get_setting("brand_name", CONFIG.get("brand_name", "OMEC"))
-    current_color = get_setting("brand_color", CONFIG.get("brand_color", "#0ea5e9"))
-    current_logo = get_setting("logo_path", CONFIG.get("logo_path", ""))
-    current_rev  = get_setting("revision_tag", CONFIG.get("revision_tag", "Rev0.1"))
-    current_prepared = get_setting("prepared_by", "")
-
-    col1, col2 = st.columns(2)
-    brand_name_in = col1.text_input("Brand Name", value=current_brand)
-    brand_color_in = col2.color_picker("Brand Color", value=current_color)
-    rev = st.text_input("Revision tag to show on PDFs (e.g., Rev0.1)", value=current_rev)
-    prepared_by_in = st.text_input("Prepared by (appears on PDFs)", value=current_prepared)
-
-    st.subheader("Logo")
-    upload = st.file_uploader("Upload a PNG/JPG logo", type=["png", "jpg", "jpeg"])
-    bundled = ["assets/logo_OMEC.png", "assets/logo_PG_Bison.png"]
-    if os.path.exists(_norm_path("assets/logo_custom.png")):
-        bundled.append("assets/logo_custom.png")
-    selected = st.selectbox("Or choose a bundled logo", options=bundled, index=0)
-
-    if upload:
-        save_dir = _norm_path("assets")
-        os.makedirs(save_dir, exist_ok=True)
-        upath = os.path.join(save_dir, "logo_custom.png")
-        with open(upath, "wb") as f:
-            f.write(upload.read())
-        selected = "assets/logo_custom.png"
-
-    c1, c2, c3, c4 = st.columns(4)
-    if c1.button("Save Settings"):
-        upsert_setting("brand_name", brand_name_in)
-        upsert_setting("brand_color", brand_color_in)
-        upsert_setting("logo_path", selected)
-        upsert_setting("revision_tag", rev)
-        upsert_setting("prepared_by", prepared_by_in)
-        st.success("Settings saved. Refresh to apply.")
-    if c2.button("Clear Logo"):
-        upsert_setting("logo_path", "")
-        st.success("Logo cleared. Refresh to apply.")
-    if c3.button("Use Default OMEC"):
-        upsert_setting("brand_name", "OMEC")
-        upsert_setting("brand_color", "#0ea5e9")
-        upsert_setting("logo_path", "assets/logo_OMEC.png")
-        upsert_setting("revision_tag", "Rev0.1")
-        upsert_setting("prepared_by", "")
-        st.success("Default branding applied. Refresh to see it.")
-    if c4.button("Rev++"):
-        upsert_setting("revision_tag", rev_bump(rev))
-        st.success("Revision bumped. Refresh Reports to see it.")
 
 # ---------- Router ----------
 if menu == "Dashboard":
@@ -926,7 +1050,5 @@ elif menu == "Versions & Snapshots":
     view_versions()
 elif menu == "Reports & Export (PDF)":
     view_reports()
-elif menu == "Maintenance":
-    view_maintenance()
 else:
-    view_settings()
+    view_maintenance()
