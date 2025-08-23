@@ -4,7 +4,7 @@
 # - low-stock rows highlighted
 # - grouped by Category with subtotals
 # - header shows Revision tag (e.g., Rev0.1)
-# - no extra gaps between categories
+# - tightened spacing between categories (no visible gaps)
 # - Inventory report includes Notes column
 
 import os, json, math
@@ -271,12 +271,14 @@ def _inventory_pdf_bytes_grouped(df: pd.DataFrame, brand_name, brand_rgb, logo_p
     grand_qty = 0.0
     grand_value = 0.0
 
-    for cat in categories:
+    for idx_cat, cat in enumerate(categories):
         block = df_sorted[df_sorted["category"].fillna("(Unspecified)") == cat]
 
-        # Category bar (no added blank lines afterward)
+        # Category bar (tighten spacing by overlapping 0.6mm with previous row border)
         span_h = 7
         _ensure_page_space(pdf, span_h + header_h, display_cols, widths, 9, brand_rgb)
+        if pdf.get_y() > 16:  # avoid going into page header
+            pdf.set_y(pdf.get_y() - 0.6)
         pdf.set_font("Helvetica", "B", 11)
         pdf.set_fill_color(*cat_bar)
         pdf.set_text_color(30, 30, 30)
@@ -302,7 +304,7 @@ def _inventory_pdf_bytes_grouped(df: pd.DataFrame, brand_name, brand_rgb, logo_p
             _ensure_page_space(pdf, row_h + 2, display_cols, widths, 9, brand_rgb)
             _draw_row(pdf, vals, widths, row_h, align_map=align_map, fill_rgb=fill)
 
-        # Category subtotal (no extra pdf.ln afterwards)
+        # Category subtotal
         sub_vals = []
         for c in present:
             if c == "sku":
@@ -315,6 +317,7 @@ def _inventory_pdf_bytes_grouped(df: pd.DataFrame, brand_name, brand_rgb, logo_p
                 sub_vals.append("")
         _ensure_page_space(pdf, 7, display_cols, widths, 9, brand_rgb)
         _draw_row(pdf, sub_vals, widths, 7, align_map=align_map, fill_rgb=light_brand, bold=True)
+        # (no extra blank line here)
 
     # Grand total row
     total_vals = []
