@@ -1,5 +1,5 @@
 # app.py — OMEC Stock Take (Streamlit)
-# Polished build: editing UX, category normalization + manager, robust snapshots, A3 PDF, etc.
+# Build: Issue Sheets (PPE/Consumables), editing UX, category normalization, A3/A4 PDFs, snapshots, etc.
 
 import os, json, re, io, zipfile, glob, datetime as dt, urllib.parse
 import streamlit as st
@@ -117,6 +117,7 @@ menu = st.sidebar.radio(
         "Dashboard",
         "Inventory",
         "Transactions",
+        "Issue Sheets",               # NEW
         "Versions & Snapshots",
         "Reports & Export (PDF)",
         "Maintenance",
@@ -264,7 +265,7 @@ def _draw_row(pdf, values, widths, row_h, align_map=None, fill_rgb=None, bold=Fa
         pdf.set_xy(x + w, y_start)
     pdf.set_xy(x_left, y_start + max_h)
 
-# ---------- Inventory PDF ----------
+# ---------- Inventory PDF (A3) ----------
 def _inventory_pdf_bytes_grouped(
     df: pd.DataFrame,
     brand_name, brand_rgb, logo_path, revision_tag,
@@ -399,11 +400,11 @@ def _inventory_pdf_bytes_grouped(
             for c in present:
                 v = r[c]
                 if c in ("quantity", "min_qty"):
-                    v = fmt_num(float(v), 2)
+                    v = f"{float(v):,.2f}"
                 elif c in ("unit_cost", "value"):
-                    v = fmt_num(float(v), 2)
+                    v = f"{float(v):,.2f}"
                 elif c == "converted_qty" and pd.notna(v):
-                    v = fmt_num(float(v), 3)
+                    v = f"{float(v):,.3f}"
                 vals.append(v if v is not None else "")
             fill = low_stock_fill if float(r["quantity"]) < float(r["min_qty"]) else None
             row_h = 7
@@ -452,6 +453,132 @@ def _inventory_pdf_bytes_grouped(
         pdf.cell(colw - 6, 5, to_latin1(name or ""), ln=0)
         pdf.set_xy(x, y0)
         pdf.cell(colw - 6, 5, to_latin1(label), ln=0)
+
+    data = pdf.output(dest="S")
+    return bytes(data) if isinstance(data, (bytes, bytearray)) else str(data).encode("latin-1", errors="ignore")
+
+# ---------- Issue Sheet PDF (A4 portrait) ----------
+def _issue_sheet_pdf_bytes(
+    df: pd.DataFrame,
+    brand_name, brand_rgb, logo_path, revision_tag,
+    manager: str, project: str, notes: str,
+    categories=None, only_available: bool=True
+) -> bytes:
+    df = df.copy()
+    if "category" in df.columns:
+        df["category"] = df["category"].apply(normalize_category)
+    df["quantity"] = pd.to_numeric(df.get("quantity"), errors="coerce").fillna(0.0)
+    df["min_qty"] = pd.to_numeric(df.get("min_qty"), errors="coerce").fillna(0.0)
+
+    if categories and "category" in df.columns:
+        df = df[df["category"].isin(categories)]
+    if only_available:
+        df = df[df["quantity"] > 0]
+
+    # Columns for printable form
+    present = ["sku","name","unit","quantity","min_qty"]
+    col_map = {"sku":"SKU","name":"Item","unit":"Unit","quantity":"On-hand","min_qty":"Min"}
+    display_cols = [col_map[c] for c in present] + ["Qty Issued", "To (Person)", "Signature", "Date"]
+
+    # Widths – measure with existing data for the left columns; the right columns fixed.
+    rows_for_width = []
+    for _, r in df.iterrows():
+        rows_for_width.append({
+            "SKU": str(r.get("sku","")),
+            "Item": str(r.get("name","")),
+            "Unit": str(r.get("unit","") or ""),
+            "On-hand": f"{float(r.get('quantity') or 0):,.2f}",
+            "Min": f"{float(r.get('min_qty') or 0):,.2f}",
+            "Qty Issued": "",
+            "To (Person)": "",
+            "Signature": "",
+            "Date": "",
+        })
+
+    pdf = BrandedPDF(
+        brand_name=brand_name, brand_rgb=brand_rgb, logo_path=logo_path, revision_tag=revision_tag,
+        orientation="P", unit="mm", format="A4"
+    )
+    pdf.add_page()
+    pdf.set_text_color(30, 30, 30)
+
+    pdf.set_font("Helvetica", "B", 15)
+    pdf.cell(0, 9, to_latin1("Stock Issue Sheet"), ln=1)
+    pdf.set_font("Helvetica", "", 10)
+    meta = [
+        f"Generated: {dt.datetime.now().strftime('%Y-%m-%d %H:%M')}",
+        f"Manager: {manager or '-'}",
+        f"Project/Job: {project or '-'}",
+    ]
+    pdf.cell(0, 6, to_latin1(" | ".join(meta)), ln=1)
+    if notes:
+        pdf.multi_cell(0, 6, to_latin1(f"Notes: {notes}"), ln=1)
+    pdf.ln(2)
+
+    page_w = pdf.w - pdf.l_margin - pdf.r_margin
+    widths = _compute_col_widths(pdf, display_cols, rows_for_width, page_w, font_size=9)
+
+    # Increase write-in column widths for handwriting
+    # (ensure "Qty Issued", "To (Person)", "Signature", "Date" are comfortable)
+    for i, name in enumerate(display_cols):
+        if name in {"Qty Issued"}:            widths[i] = max(widths[i], 20)
+        if name in {"To (Person)"}:           widths[i] = max(widths[i], 35)
+        if name in {"Signature"}:             widths[i] = max(widths[i], 32)
+        if name in {"Date"}:                  widths[i] = max(widths[i], 22)
+
+    _draw_header_row(pdf, display_cols, widths, 9, brand_rgb)
+    align_map = {display_cols.index("On-hand"): "R", display_cols.index("Min"): "R"}
+    cat_bar = lighten(brand_rgb, 0.80)
+
+    # Group by category
+    if "category" in df.columns:
+        df = df.sort_values(by=["category","sku","name"], kind="stable")
+        groups = df["category"].fillna("(Unspecified)").unique().tolist()
+    else:
+        groups = ["(All)"]
+        df["category"] = "(All)"
+
+    for cat in groups:
+        block = df[df["category"].fillna("(Unspecified)") == cat]
+        if block.empty:
+            continue
+
+        # Category row
+        _ensure_page_space(pdf, 8, display_cols, widths, 9, brand_rgb)
+        pdf.set_font("Helvetica", "B", 10)
+        pdf.set_fill_color(*cat_bar)
+        pdf.set_text_color(30, 30, 30)
+        pdf.cell(sum(widths), 7, to_latin1(f"Category: {cat}"), border=1, ln=1, fill=True)
+
+        # Items
+        pdf.set_font("Helvetica", "", 9)
+        for _, r in block.iterrows():
+            values = [
+                r.get("sku",""),
+                r.get("name",""),
+                r.get("unit","") or "",
+                f"{float(r.get('quantity') or 0):,.2f}",
+                f"{float(r.get('min_qty') or 0):,.2f}",
+                "", "", "", ""
+            ]
+            _ensure_page_space(pdf, 8, display_cols, widths, 9, brand_rgb)
+            _draw_row(pdf, values, widths, 7, align_map=align_map, border="1")
+
+    # Footer sign-off
+    pdf.ln(6)
+    pdf.set_font("Helvetica", "", 9)
+    w = (pdf.w - pdf.l_margin - pdf.r_margin)
+    colw = w / 2.0
+    y0 = pdf.get_y()
+    # Issued by / Received by
+    pdf.set_xy(pdf.l_margin, y0 + 10)
+    pdf.line(pdf.l_margin, y0 + 9, pdf.l_margin + colw - 6, y0 + 9)
+    pdf.set_xy(pdf.l_margin, y0)
+    pdf.cell(colw - 6, 5, to_latin1("Issued by (Store/Manager)"), ln=0)
+    pdf.set_xy(pdf.l_margin + colw, y0 + 10)
+    pdf.line(pdf.l_margin + colw, y0 + 9, pdf.l_margin + w - 6, y0 + 9)
+    pdf.set_xy(pdf.l_margin + colw, y0)
+    pdf.cell(colw - 6, 5, to_latin1("Received by (Workshop)"), ln=0)
 
     data = pdf.output(dest="S")
     return bytes(data) if isinstance(data, (bytes, bytearray)) else str(data).encode("latin-1", errors="ignore")
@@ -729,6 +856,82 @@ def view_transactions():
         ]
     st.dataframe(f, use_container_width=True)
 
+# ---------- NEW: Issue Sheets ----------
+def view_issue_sheets():
+    st.title("📝 Issue Sheets")
+    st.caption("Create a printable Stock Issue Sheet for the workshop (PPE & consumables). Also log issues quickly.")
+
+    if not FPDF_AVAILABLE:
+        st.error("PDF engine not available. Add `fpdf2==2.7.9` to requirements.txt.")
+        return
+
+    items = get_items()
+    df = pd.DataFrame(items)
+    if "category" in df.columns:
+        df["category"] = df["category"].apply(normalize_category)
+
+    if df.empty:
+        st.info("No inventory yet. Add items first.")
+        return
+
+    # Choose categories to include on the sheet
+    all_cats = sorted([c for c in df.get("category", pd.Series(dtype=str)).dropna().unique().tolist()])
+
+    # Small heuristic for default consumables/PPE selection
+    def looks_consumable(x: str) -> bool:
+        s = x.lower()
+        keys = ["disc", "cutting", "grinding", "weld", "wire", "ppe", "glove", "mask", "goggle", "paint", "oxygen", "gas"]
+        return any(k in s for k in keys)
+
+    default_cats = [c for c in all_cats if looks_consumable(c)] or all_cats
+    cat_select = st.multiselect("Categories to include", options=all_cats, default=default_cats)
+
+    c1, c2, c3 = st.columns(3)
+    only_avail = c1.checkbox("Only show items with qty > 0", value=True)
+    mgr = c2.text_input("Manager (issued by)")
+    project = c3.text_input("Project / Job")
+    notes = st.text_input("Notes (optional)")
+
+    # Generate PDF
+    build = st.button("Generate Issue Sheet (A4 PDF)")
+    if build:
+        pdf_bytes = _issue_sheet_pdf_bytes(
+            df, brand_name, brand_rgb, logo_path, revision_tag,
+            manager=mgr, project=project, notes=notes,
+            categories=cat_select if cat_select else None,
+            only_available=only_avail,
+        )
+        st.download_button(
+            "Download Stock Issue Sheet",
+            data=pdf_bytes,
+            file_name=f"IssueSheet_{timestamp()}.pdf",
+            mime="application/pdf",
+        )
+
+    st.divider()
+    st.subheader("Quick Issue (log immediately)")
+    # Shortcut to record an 'issue' to a person
+    filt_df = df[df["category"].isin(cat_select)] if cat_select else df
+    sku_list = sorted(filt_df["sku"].unique().tolist())
+
+    with st.form("quick_issue_form"):
+        cols = st.columns(4)
+        q_sku = cols[0].selectbox("SKU", options=sku_list)
+        q_qty = cols[1].number_input("Qty issued", value=1.0, min_value=0.0, step=1.0, format="%.3f")
+        q_to  = cols[2].text_input("To (person)")
+        q_proj= cols[3].text_input("Project/Job", value=project)
+
+        notes2 = st.text_input("Notes")
+        submit = st.form_submit_button("Log Issue")
+        if submit:
+            if not q_sku or q_qty <= 0:
+                st.error("Choose a SKU and a positive quantity.")
+            else:
+                add_transaction(q_sku, -abs(q_qty), reason="issue", project=q_proj, reference="", user=q_to, notes=notes2)
+                st.success(f"Issue logged for {q_sku} → {q_to} (-{q_qty})")
+                st.rerun()
+
+# ---------- Versions / Snapshots ----------
 def _zip_list():
     return sorted(glob.glob(os.path.join(SNAP_DIR, "*.zip")), reverse=True)
 
@@ -902,6 +1105,7 @@ def _restore_from_bytes(zip_bytes: bytes, replace_items: bool, append_tx: bool, 
 
     st.success(f"Restore complete. Items loaded: {added_items}" + (f" | Transactions added: {added_tx}" if append_tx and tx_name else ""))
 
+# ---------- Reports ----------
 def view_reports():
     st.title("🧾 Reports & Export (PDF)")
     st.caption("A3 landscape • grouped by category • subtotals • totals row • notes • unit conversion • sign-off block")
@@ -1037,6 +1241,7 @@ def view_reports():
     pdf_bytes_tx = df_to_pdf_bytes_pro("Transaction Log", df_tx, meta, brand_name, brand_rgb, logo_path, revision_tag)
     st.download_button("Download Transactions PDF", data=pdf_bytes_tx, file_name=f"transactions_{timestamp()}.pdf", mime="application/pdf")
 
+# ---------- Maintenance ----------
 def view_maintenance():
     st.title("🛠️ Maintenance")
     st.caption("Maintenance usage + Category Manager / cleanup tools.")
@@ -1109,6 +1314,8 @@ elif menu == "Inventory":
     view_inventory()
 elif menu == "Transactions":
     view_transactions()
+elif menu == "Issue Sheets":
+    view_issue_sheets()
 elif menu == "Versions & Snapshots":
     view_versions()
 elif menu == "Reports & Export (PDF)":
