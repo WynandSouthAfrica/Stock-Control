@@ -1,5 +1,5 @@
-# app.py — OMEC Stock Take (single-file app) — SAFE LOGO VERSION
-import os, json
+# app.py — OMEC Stock Take (single-file app) — SAFE LOGO + PDF EXPORTS
+import os, json, io
 import streamlit as st
 import pandas as pd
 
@@ -9,7 +9,13 @@ from db import (
     get_versions, save_version_record,
     upsert_setting, get_setting
 )
-from utils import export_snapshot
+from utils import export_snapshot, timestamp
+
+# ---- PDF export deps
+from reportlab.lib.pagesizes import A4, landscape
+from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+from reportlab.lib import colors
+from reportlab.lib.styles import getSampleStyleSheet
 
 st.set_page_config(page_title="OMEC Stock Take", page_icon="🗃️", layout="wide")
 
@@ -41,8 +47,38 @@ def safe_show_logo(path: str):
         if apath and os.path.exists(apath):
             st.sidebar.image(apath, use_container_width=True)
     except Exception:
-        # swallow any image/IO errors
         pass
+
+def df_to_pdf_bytes(title: str, df: pd.DataFrame, meta: list[str] | None = None) -> bytes:
+    """Render a DataFrame as a simple paginated PDF table."""
+    if meta is None:
+        meta = []
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(
+        buf, pagesize=landscape(A4),
+        leftMargin=12, rightMargin=12, topMargin=12, bottomMargin=12
+    )
+    styles = getSampleStyleSheet()
+    elems = [Paragraph(title, styles["Title"])]
+    for line in meta:
+        elems.append(Paragraph(line, styles["Normal"]))
+    elems.append(Spacer(1, 6))
+
+    data = [list(df.columns)] + df.astype(str).values.tolist()
+    table = Table(data, repeatRows=1)
+    table.setStyle(TableStyle([
+        ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#E5E7EB")),
+        ("FONTNAME", (0,0), (-1,0), "Helvetica-Bold"),
+        ("FONTSIZE", (0,0), (-1,-1), 8),
+        ("GRID", (0,0), (-1,-1), 0.25, colors.HexColor("#CBD5E1")),
+        ("ALIGN", (0,0), (-1,-1), "LEFT"),
+        ("VALIGN", (0,0), (-1,-1), "TOP"),
+    ]))
+    elems.append(table)
+    doc.build(elems)
+    pdf = buf.getvalue()
+    buf.close()
+    return pdf
 
 # ---- Read settings (with config defaults) -----------------------------------
 logo_path = get_setting("logo_path", CONFIG.get("logo_path", ""))
@@ -196,38 +232,77 @@ def view_versions():
 
 def view_reports():
     st.title("🧾 Reports & Export")
-    st.caption("Filter and export inventory and transaction data (CSV).")
+    st.caption("Filter and export inventory and transaction data (CSV/PDF).")
 
     items = get_items()
     tx = get_transactions(limit=100_000)
 
+    # ---------- Inventory ----------
     st.subheader("Inventory")
     df_items = pd.DataFrame(items)
     if not df_items.empty:
-        cat = st.multiselect("Filter by Category", sorted({i["category"] for i in items if i.get("category")}))
-        loc = st.multiselect("Filter by Location", sorted({i["location"] for i in items if i.get("location")}))
+        cat = st.multiselect("Filter by Category", sorted({i.get("category") for i in items if i.get("category")}))
+        loc = st.multiselect("Filter by Location", sorted({i.get("location") for i in items if i.get("location")}))
         filtered = df_items.copy()
         if cat:
             filtered = filtered[filtered["category"].isin(cat)]
         if loc:
             filtered = filtered[filtered["location"].isin(loc)]
+
         st.dataframe(filtered, use_container_width=True)
+
         st.download_button(
-            "Export Inventory CSV",
+            "Export Inventory CSV (comma)",
             data=filtered.to_csv(index=False).encode("utf-8"),
-            file_name="inventory_export.csv"
+            file_name=f"inventory_{timestamp()}.csv"
+        )
+        st.download_button(
+            "Export Inventory CSV (semicolon • Excel)",
+            data=filtered.to_csv(index=False, sep=";").encode("utf-8"),
+            file_name=f"inventory_{timestamp()}_semicolon.csv"
+        )
+
+        inv_pdf = df_to_pdf_bytes(
+            "Inventory Report",
+            filtered,
+            [f"Generated: {timestamp()}", f"Rows: {len(filtered)}"]
+        )
+        st.download_button(
+            "Download Inventory PDF",
+            data=inv_pdf,
+            file_name=f"inventory_{timestamp()}.pdf",
+            mime="application/pdf"
         )
     else:
         st.info("No items to show.")
 
+    # ---------- Transactions ----------
     st.subheader("Transactions")
     df_tx = pd.DataFrame(tx)
     if not df_tx.empty:
         st.dataframe(df_tx, use_container_width=True)
+
         st.download_button(
-            "Export Transactions CSV",
+            "Export Transactions CSV (comma)",
             data=df_tx.to_csv(index=False).encode("utf-8"),
-            file_name="transactions_export.csv"
+            file_name=f"transactions_{timestamp()}.csv"
+        )
+        st.download_button(
+            "Export Transactions CSV (semicolon • Excel)",
+            data=df_tx.to_csv(index=False, sep=";").encode("utf-8"),
+            file_name=f"transactions_{timestamp()}_semicolon.csv"
+        )
+
+        tx_pdf = df_to_pdf_bytes(
+            "Transaction Log",
+            df_tx,
+            [f"Generated: {timestamp()}", f"Rows: {len(df_tx)}"]
+        )
+        st.download_button(
+            "Download Transactions PDF",
+            data=tx_pdf,
+            file_name=f"transactions_{timestamp()}.pdf",
+            mime="application/pdf"
         )
     else:
         st.info("No transactions found.")
@@ -252,66 +327,4 @@ def view_maintenance():
         submitted = st.form_submit_button("Log Maintenance Usage")
         if submitted:
             if not sku or qty_used >= 0:
-                st.error("Choose a SKU and enter a negative quantity to deduct.")
-            else:
-                add_transaction(sku, qty_used, reason="maintenance", project=project, reference="", user=user, notes=notes)
-                st.success("Maintenance usage logged (stock deducted).")
-
-def view_settings():
-    st.title("⚙️ Settings")
-    st.caption("Branding and display options.")
-
-    current_logo = get_setting("logo_path", "")
-    current_brand = get_setting("brand_name", CONFIG.get("brand_name", "OMEC"))
-    current_color = get_setting("brand_color", CONFIG.get("brand_color", "#0ea5e9"))
-
-    col1, col2 = st.columns(2)
-    brand_name_in = col1.text_input("Brand Name", value=current_brand)
-    brand_color_in = col2.color_picker("Brand Color", value=current_color)
-
-    st.subheader("Logo")
-    upload = st.file_uploader("Upload a PNG/JPG logo", type=["png","jpg","jpeg"])
-    # Bundled options
-    bundled = ["assets/logo_OMEC.png", "assets/logo_PG_Bison.png"]
-    if os.path.exists(_norm_path("assets/logo_custom.png")):
-        bundled.append("assets/logo_custom.png")
-    selected = st.selectbox("Or choose a bundled logo", options=bundled, index=0)
-
-    if upload:
-        save_dir = _norm_path("assets")
-        os.makedirs(save_dir, exist_ok=True)
-        upath = os.path.join(save_dir, "logo_custom.png")
-        with open(upath, "wb") as f:
-            f.write(upload.read())
-        selected = "assets/logo_custom.png"
-
-    c1, c2, c3 = st.columns([1,1,1])
-    if c1.button("Save Settings"):
-        upsert_setting("brand_name", brand_name_in)
-        upsert_setting("brand_color", brand_color_in)
-        upsert_setting("logo_path", selected)
-        st.success("Settings saved. Refresh to apply.")
-    if c2.button("Clear Logo"):
-        upsert_setting("logo_path", "")
-        st.success("Logo cleared. Refresh to apply.")
-    if c3.button("Use Default OMEC"):
-        upsert_setting("brand_name", "OMEC")
-        upsert_setting("brand_color", "#0ea5e9")
-        upsert_setting("logo_path", "assets/logo_OMEC.png")
-        st.success("Default branding applied. Refresh to see it.")
-
-# ---- Router -----------------------------------------------------------------
-if menu == "Dashboard":
-    view_dashboard()
-elif menu == "Inventory":
-    view_inventory()
-elif menu == "Transactions":
-    view_transactions()
-elif menu == "Versions & Snapshots":
-    view_versions()
-elif menu == "Reports & Export":
-    view_reports()
-elif menu == "Maintenance":
-    view_maintenance()
-else:
-    view_settings()
+                st.error("Choose a SKU and enter a n
