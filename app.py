@@ -327,4 +327,65 @@ def view_maintenance():
         submitted = st.form_submit_button("Log Maintenance Usage")
         if submitted:
             if not sku or qty_used >= 0:
-                st.error("Choose a SKU and enter a n
+                st.error("Choose a SKU and enter a negative quantity to deduct.")
+            else:
+                add_transaction(sku, qty_used, reason="maintenance", project=project, reference="", user=user, notes=notes)
+                st.success("Maintenance usage logged (stock deducted).")
+
+def view_settings():
+    st.title("⚙️ Settings")
+    st.caption("Branding and display options.")
+
+    current_logo = get_setting("logo_path", "")
+    current_brand = get_setting("brand_name", CONFIG.get("brand_name", "OMEC"))
+    current_color = get_setting("brand_color", CONFIG.get("brand_color", "#0ea5e9"))
+
+    col1, col2 = st.columns(2)
+    brand_name_in = col1.text_input("Brand Name", value=current_brand)
+    brand_color_in = col2.color_picker("Brand Color", value=current_color)
+
+    st.subheader("Logo")
+    upload = st.file_uploader("Upload a PNG/JPG logo", type=["png","jpg","jpeg"])
+    bundled = ["assets/logo_OMEC.png", "assets/logo_PG_Bison.png"]
+    if os.path.exists(_norm_path("assets/logo_custom.png")):
+        bundled.append("assets/logo_custom.png")
+    selected = st.selectbox("Or choose a bundled logo", options=bundled, index=0)
+
+    if upload:
+        save_dir = _norm_path("assets")
+        os.makedirs(save_dir, exist_ok=True)
+        upath = os.path.join(save_dir, "logo_custom.png")
+        with open(upath, "wb") as f:
+            f.write(upload.read())
+        selected = "assets/logo_custom.png"
+
+    c1, c2, c3 = st.columns([1,1,1])
+    if c1.button("Save Settings"):
+        upsert_setting("brand_name", brand_name_in)
+        upsert_setting("brand_color", brand_color_in)
+        upsert_setting("logo_path", selected)
+        st.success("Settings saved. Refresh to apply.")
+    if c2.button("Clear Logo"):
+        upsert_setting("logo_path", "")
+        st.success("Logo cleared. Refresh to apply.")
+    if c3.button("Use Default OMEC"):
+        upsert_setting("brand_name", "OMEC")
+        upsert_setting("brand_color", "#0ea5e9")
+        upsert_setting("logo_path", "assets/logo_OMEC.png")
+        st.success("Default branding applied. Refresh to see it.")
+
+# ---- Router -----------------------------------------------------------------
+if menu == "Dashboard":
+    view_dashboard()
+elif menu == "Inventory":
+    view_inventory()
+elif menu == "Transactions":
+    view_transactions()
+elif menu == "Versions & Snapshots":
+    view_versions()
+elif menu == "Reports & Export":
+    view_reports()
+elif menu == "Maintenance":
+    view_maintenance()
+else:
+    view_settings()
