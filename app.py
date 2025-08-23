@@ -169,7 +169,8 @@ def _ensure_page_space(pdf, needed_h, columns, widths, font_size, brand_rgb):
     pdf.add_page()
     _draw_header_row(pdf, columns, widths, font_size, brand_rgb)
 
-def _draw_row(pdf, values, widths, row_h, align_map=None, fill_rgb=None, bold=False, text_rgb=(15,15,15)):
+def _draw_row(pdf, values, widths, row_h, align_map=None, fill_rgb=None, bold=False, text_rgb=(15,15,15), border="1"):
+    """Draw one logical row made of multiple MultiCells with custom border string (e.g., 'LTR')."""
     if align_map is None:
         align_map = {}
     pdf.set_font("Helvetica", "B" if bold else "", 9)
@@ -190,10 +191,10 @@ def _draw_row(pdf, values, widths, row_h, align_map=None, fill_rgb=None, bold=Fa
         align = align_map.get(idx, "L")
         if fill_rgb:
             pdf.set_fill_color(*fill_rgb)
-            pdf.multi_cell(w, row_h, str(v if v is not None else ""), border=1, align=align,
+            pdf.multi_cell(w, row_h, str(v if v is not None else ""), border=border, align=align,
                            new_x="RIGHT", new_y="TOP", fill=True)
         else:
-            pdf.multi_cell(w, row_h, str(v if v is not None else ""), border=1, align=align,
+            pdf.multi_cell(w, row_h, str(v if v is not None else ""), border=border, align=align,
                            new_x="RIGHT", new_y="TOP")
         pdf.set_xy(x + w, y_start)
     pdf.set_xy(x_left, y_start + max_h)
@@ -271,18 +272,16 @@ def _inventory_pdf_bytes_grouped(df: pd.DataFrame, brand_name, brand_rgb, logo_p
     grand_qty = 0.0
     grand_value = 0.0
 
-    for idx_cat, cat in enumerate(categories):
+    for cat in categories:
         block = df_sorted[df_sorted["category"].fillna("(Unspecified)") == cat]
 
-        # Category bar (tighten spacing by overlapping 0.6mm with previous row border)
+        # Category bar — draw WITHOUT bottom border so next row's top border touches (no gap)
         span_h = 7
         _ensure_page_space(pdf, span_h + header_h, display_cols, widths, 9, brand_rgb)
-        if pdf.get_y() > 16:  # avoid going into page header
-            pdf.set_y(pdf.get_y() - 0.6)
         pdf.set_font("Helvetica", "B", 11)
         pdf.set_fill_color(*cat_bar)
         pdf.set_text_color(30, 30, 30)
-        pdf.cell(sum(widths), span_h, f"Category: {cat}", border=1, ln=1, fill=True)
+        pdf.cell(sum(widths), span_h, f"Category: {cat}", border="LTR", ln=1, fill=True)
 
         cat_qty = float(block["quantity"].sum())
         cat_value = float((block["quantity"] * block["unit_cost"]).sum())
@@ -304,7 +303,7 @@ def _inventory_pdf_bytes_grouped(df: pd.DataFrame, brand_name, brand_rgb, logo_p
             _ensure_page_space(pdf, row_h + 2, display_cols, widths, 9, brand_rgb)
             _draw_row(pdf, vals, widths, row_h, align_map=align_map, fill_rgb=fill)
 
-        # Category subtotal
+        # Category subtotal — also remove bottom border so the NEXT category header touches it
         sub_vals = []
         for c in present:
             if c == "sku":
@@ -316,8 +315,7 @@ def _inventory_pdf_bytes_grouped(df: pd.DataFrame, brand_name, brand_rgb, logo_p
             else:
                 sub_vals.append("")
         _ensure_page_space(pdf, 7, display_cols, widths, 9, brand_rgb)
-        _draw_row(pdf, sub_vals, widths, 7, align_map=align_map, fill_rgb=light_brand, bold=True)
-        # (no extra blank line here)
+        _draw_row(pdf, sub_vals, widths, 7, align_map=align_map, fill_rgb=light_brand, bold=True, border="LTR")
 
     # Grand total row
     total_vals = []
