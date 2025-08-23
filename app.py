@@ -1,5 +1,5 @@
 # app.py — OMEC Stock Take (single-file) — Safe logo + Professional PDF exports (no CSV)
-import os, json, html, math
+import os, json, math
 import streamlit as st
 import pandas as pd
 
@@ -223,7 +223,13 @@ def df_to_pdf_bytes_pro(
         pdf.cell(0, 6, txt=str(line), ln=1)
     pdf.ln(2)
     draw_table(pdf, df, header_fill_rgb=brand_rgb, font_size=9)
-    return pdf.output(dest="S").encode("latin-1", errors="ignore")
+
+    # Return bytes (fpdf2 returns bytes/bytearray for dest='S')
+    data = pdf.output(dest="S")
+    if isinstance(data, (bytes, bytearray)):
+        return bytes(data)
+    # fallback for older libs returning str
+    return str(data).encode("latin-1", errors="ignore")
 
 # ---------- Settings (with config defaults) -----------------------------------
 logo_path = get_setting("logo_path", CONFIG.get("logo_path", ""))
