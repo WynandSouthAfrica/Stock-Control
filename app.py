@@ -1,7 +1,9 @@
 # app.py — OMEC Stock Take (Streamlit)
-# Build: Issue Sheets (PPE/Consumables), editing UX, category normalization, A3/A4 PDFs, snapshots, etc.
+# Build: Issue Sheets (blank lines per item), editing UX, category normalization, A3/A4 PDFs, snapshots, etc.
 
-import os, json, re, io, zipfile, glob, datetime as dt, urllib.parse
+import os, json, re, io, zipfile, glob, math
+import datetime as dt
+import urllib.parse
 import streamlit as st
 import pandas as pd
 
@@ -83,7 +85,6 @@ def get_bool_setting(name: str, default: bool) -> bool:
 
 # --- Category normalization utility ---
 def normalize_category(cat):
-    """Trim, collapse spaces, Title Case; keep None as None."""
     if cat is None:
         return None
     s = str(cat).strip()
@@ -92,7 +93,7 @@ def normalize_category(cat):
     s = re.sub(r"\s+", " ", s)
     return s.title()
 
-# ---------- Settings (with config defaults) ----------
+# ---------- Settings ----------
 logo_path = get_setting("logo_path", CONFIG.get("logo_path", ""))
 brand_name = get_setting("brand_name", CONFIG.get("brand_name", "OMEC"))
 brand_color = get_setting("brand_color", CONFIG.get("brand_color", "#0ea5e9"))
@@ -100,7 +101,7 @@ revision_tag = get_setting("revision_tag", CONFIG.get("revision_tag", "Rev0.1"))
 prepared_by = get_setting("prepared_by", "")
 checked_by  = get_setting("checked_by", "")
 approved_by = get_setting("approved_by", "")
-email_recipients = get_setting("email_recipients", "")  # comma-separated
+email_recipients = get_setting("email_recipients", "")
 auto_backup_enabled = get_bool_setting("auto_backup_enabled", True)
 brand_rgb = hex_to_rgb(brand_color)
 
@@ -117,7 +118,7 @@ menu = st.sidebar.radio(
         "Dashboard",
         "Inventory",
         "Transactions",
-        "Issue Sheets",               # NEW
+        "Issue Sheets",
         "Versions & Snapshots",
         "Reports & Export (PDF)",
         "Maintenance",
@@ -143,7 +144,7 @@ if auto_backup_enabled and not _has_snapshot_for_today():
     except Exception:
         st.sidebar.warning("Auto-backup attempt failed (non-blocking).")
 
-# ---------- PDF core ----------
+# ---------- PDF base ----------
 if FPDF_AVAILABLE:
     class BrandedPDF(FPDF):
         def __init__(self, brand_name: str, brand_rgb: tuple, logo_path: str = "", revision_tag: str = "Rev0.1", *args, **kwargs):
@@ -462,8 +463,14 @@ def _issue_sheet_pdf_bytes(
     df: pd.DataFrame,
     brand_name, brand_rgb, logo_path, revision_tag,
     manager: str, project: str, notes: str,
-    categories=None, only_available: bool=True
+    categories=None, only_available: bool=True,
+    blanks_cap: int = 12, fixed_blanks: int | None = None
 ) -> bytes:
+    """
+    Draws one summary row per item (showing On-hand), then appends blank rows
+    for writing issues. Blank rows count = min(int(On-hand) + 1, blanks_cap),
+    unless fixed_blanks is provided (then use that constant).
+    """
     df = df.copy()
     if "category" in df.columns:
         df["category"] = df["category"].apply(normalize_category)
@@ -475,12 +482,10 @@ def _issue_sheet_pdf_bytes(
     if only_available:
         df = df[df["quantity"] > 0]
 
-    # Columns for printable form
     present = ["sku","name","unit","quantity","min_qty"]
     col_map = {"sku":"SKU","name":"Item","unit":"Unit","quantity":"On-hand","min_qty":"Min"}
     display_cols = [col_map[c] for c in present] + ["Qty Issued", "To (Person)", "Signature", "Date"]
 
-    # Widths – measure with existing data for the left columns; the right columns fixed.
     rows_for_width = []
     for _, r in df.iterrows():
         rows_for_width.append({
@@ -518,8 +523,6 @@ def _issue_sheet_pdf_bytes(
     page_w = pdf.w - pdf.l_margin - pdf.r_margin
     widths = _compute_col_widths(pdf, display_cols, rows_for_width, page_w, font_size=9)
 
-    # Increase write-in column widths for handwriting
-    # (ensure "Qty Issued", "To (Person)", "Signature", "Date" are comfortable)
     for i, name in enumerate(display_cols):
         if name in {"Qty Issued"}:            widths[i] = max(widths[i], 20)
         if name in {"To (Person)"}:           widths[i] = max(widths[i], 35)
@@ -530,7 +533,6 @@ def _issue_sheet_pdf_bytes(
     align_map = {display_cols.index("On-hand"): "R", display_cols.index("Min"): "R"}
     cat_bar = lighten(brand_rgb, 0.80)
 
-    # Group by category
     if "category" in df.columns:
         df = df.sort_values(by=["category","sku","name"], kind="stable")
         groups = df["category"].fillna("(Unspecified)").unique().tolist()
@@ -543,26 +545,40 @@ def _issue_sheet_pdf_bytes(
         if block.empty:
             continue
 
-        # Category row
         _ensure_page_space(pdf, 8, display_cols, widths, 9, brand_rgb)
         pdf.set_font("Helvetica", "B", 10)
         pdf.set_fill_color(*cat_bar)
         pdf.set_text_color(30, 30, 30)
         pdf.cell(sum(widths), 7, to_latin1(f"Category: {cat}"), border=1, ln=1, fill=True)
 
-        # Items
         pdf.set_font("Helvetica", "", 9)
         for _, r in block.iterrows():
+            onhand = float(r.get("quantity") or 0.0)
+            minq   = float(r.get("min_qty") or 0.0)
+
+            # Summary row with totals visible
             values = [
                 r.get("sku",""),
                 r.get("name",""),
                 r.get("unit","") or "",
-                f"{float(r.get('quantity') or 0):,.2f}",
-                f"{float(r.get('min_qty') or 0):,.2f}",
+                f"{onhand:,.2f}",
+                f"{minq:,.2f}",
                 "", "", "", ""
             ]
             _ensure_page_space(pdf, 8, display_cols, widths, 9, brand_rgb)
             _draw_row(pdf, values, widths, 7, align_map=align_map, border="1")
+
+            # How many blank lines under this item?
+            if fixed_blanks is not None and fixed_blanks > 0:
+                blanks = fixed_blanks
+            else:
+                blanks = min(max(0, int(math.floor(onhand))) + 1, max(1, int(blanks_cap)))
+
+            # Draw blank sign-off rows
+            for _i in range(blanks):
+                blank_vals = ["", "", "", "", "", "", "", "", ""]
+                _ensure_page_space(pdf, 8, display_cols, widths, 9, brand_rgb)
+                _draw_row(pdf, blank_vals, widths, 7, align_map=align_map, border="1")
 
     # Footer sign-off
     pdf.ln(6)
@@ -570,7 +586,6 @@ def _issue_sheet_pdf_bytes(
     w = (pdf.w - pdf.l_margin - pdf.r_margin)
     colw = w / 2.0
     y0 = pdf.get_y()
-    # Issued by / Received by
     pdf.set_xy(pdf.l_margin, y0 + 10)
     pdf.line(pdf.l_margin, y0 + 9, pdf.l_margin + colw - 6, y0 + 9)
     pdf.set_xy(pdf.l_margin, y0)
@@ -654,7 +669,6 @@ def view_inventory():
     if "category" in df.columns:
         df["category"] = df["category"].apply(normalize_category)
 
-    # Quick filter
     filt = st.text_input("Filter (SKU/Name/Category/Location contains…)")
     fdf = df.copy()
     if filt:
@@ -859,7 +873,7 @@ def view_transactions():
 # ---------- NEW: Issue Sheets ----------
 def view_issue_sheets():
     st.title("📝 Issue Sheets")
-    st.caption("Create a printable Stock Issue Sheet for the workshop (PPE & consumables). Also log issues quickly.")
+    st.caption("Create a printable Stock Issue Sheet (PPE & consumables) with blank sign-off rows, and log issues quickly.")
 
     if not FPDF_AVAILABLE:
         st.error("PDF engine not available. Add `fpdf2==2.7.9` to requirements.txt.")
@@ -874,10 +888,8 @@ def view_issue_sheets():
         st.info("No inventory yet. Add items first.")
         return
 
-    # Choose categories to include on the sheet
     all_cats = sorted([c for c in df.get("category", pd.Series(dtype=str)).dropna().unique().tolist()])
 
-    # Small heuristic for default consumables/PPE selection
     def looks_consumable(x: str) -> bool:
         s = x.lower()
         keys = ["disc", "cutting", "grinding", "weld", "wire", "ppe", "glove", "mask", "goggle", "paint", "oxygen", "gas"]
@@ -892,7 +904,11 @@ def view_issue_sheets():
     project = c3.text_input("Project / Job")
     notes = st.text_input("Notes (optional)")
 
-    # Generate PDF
+    with st.expander("Sheet layout options", expanded=False):
+        cap = st.slider("Cap blank lines per item (On-hand + 1, capped)", min_value=1, max_value=40, value=12)
+        fixed_n = st.number_input("Or use a fixed number of blank rows per item (0 = disabled)", min_value=0, max_value=50, value=0)
+        fixed_blanks = fixed_n if fixed_n > 0 else None
+
     build = st.button("Generate Issue Sheet (A4 PDF)")
     if build:
         pdf_bytes = _issue_sheet_pdf_bytes(
@@ -900,6 +916,7 @@ def view_issue_sheets():
             manager=mgr, project=project, notes=notes,
             categories=cat_select if cat_select else None,
             only_available=only_avail,
+            blanks_cap=cap, fixed_blanks=fixed_blanks
         )
         st.download_button(
             "Download Stock Issue Sheet",
@@ -910,7 +927,6 @@ def view_issue_sheets():
 
     st.divider()
     st.subheader("Quick Issue (log immediately)")
-    # Shortcut to record an 'issue' to a person
     filt_df = df[df["category"].isin(cat_select)] if cat_select else df
     sku_list = sorted(filt_df["sku"].unique().tolist())
 
@@ -950,7 +966,6 @@ def view_versions():
     st.title("🕒 Versions & Snapshots")
     st.caption("Create timestamped ZIP archives of your data for traceability. Also supports restore and site profiles.")
 
-    # --- Create snapshot ---
     tag = st.text_input("Version tag (e.g., V0.1, 'after_stock_count')")
     note = st.text_area("Note")
     if st.button("Create Snapshot ZIP"):
