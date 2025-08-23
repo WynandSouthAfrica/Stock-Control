@@ -1,14 +1,15 @@
 # app.py — OMEC Stock Take (single-file)
-# Polished build + Manager filters + PDF latin-1 safety:
+# Features:
 # - Inventory filter + bulk edit
 # - Dashboard low-stock & category totals
-# - Reports: only-low-stock, sort-by, **category multi-select**, only-available
+# - Reports: only-low-stock, sort-by, category multi-select, only-available
 # - Transactions filters
 # - Settings: Prepared-by + Rev++ button
-# - PDFs remain A3 landscape, grouped subtotals, totals row, Notes column, NO GAPS
+# - Snapshots: Create ZIP + **Restore from ZIP** (replace items, optional append transactions)
+# - PDFs: A3 landscape, grouped subtotals, totals row, Notes column, NO GAPS
 # - PDF text sanitized to latin-1 (fix FPDFUnicodeEncodingException)
 
-import os, json, math, re
+import os, json, math, re, io, zipfile
 import streamlit as st
 import pandas as pd
 
@@ -305,8 +306,7 @@ def _inventory_pdf_bytes_grouped(
         meta.append("Low-stock only")
     if prepared_by:
         meta.append(f"Prepared by: {prepared_by}")
-    meta_line = " | ".join([to_latin1(m) for m in meta])
-    pdf.cell(0, 6, meta_line, ln=1)
+    pdf.cell(0, 6, to_latin1(" | ".join(meta)), ln=1)
     pdf.ln(2)
 
     page_w = pdf.w - pdf.l_margin - pdf.r_margin
@@ -588,7 +588,9 @@ def view_transactions():
 
 def view_versions():
     st.title("🕒 Versions & Snapshots")
-    st.caption("Create timestamped ZIP archives of your data for traceability.")
+    st.caption("Create timestamped ZIP archives of your data for traceability. You can also restore from a snapshot.")
+
+    # --- Create snapshot ---
     tag = st.text_input("Version tag (e.g., V0.1, 'after_stock_count')")
     note = st.text_area("Note")
 
@@ -600,6 +602,105 @@ def view_versions():
         st.success(f"Snapshot created: {zip_path}")
         with open(zip_path, "rb") as f:
             st.download_button("Download ZIP", data=f.read(), file_name=os.path.basename(zip_path))
+
+    # --- Restore snapshot ---
+    st.divider()
+    st.subheader("Restore from Snapshot ZIP")
+    st.caption("Use this to rebuild your DB from a previously saved ZIP (e.g., after a rebuild or when switching sites).")
+    up = st.file_uploader("Upload snapshot ZIP", type=["zip"])
+    colr1, colr2, colr3 = st.columns(3)
+    replace_items = colr1.checkbox("Replace items (clear & load)", value=True)
+    append_tx = colr2.checkbox("Append transactions", value=False)
+    skip_dup = colr3.checkbox("Skip duplicate transactions", value=True)
+
+    if up and st.button("Restore now"):
+        try:
+            zf = zipfile.ZipFile(io.BytesIO(up.read()))
+            names = {n.lower(): n for n in zf.namelist()}
+            inv_name = next((names[n] for n in names if n.endswith("inventory.csv")), None)
+            tx_name  = next((names[n] for n in names if n.endswith("transactions.csv")), None)
+
+            if not inv_name:
+                st.error("inventory.csv not found in ZIP.")
+                return
+
+            # Load inventory
+            inv_df = pd.read_csv(io.BytesIO(zf.read(inv_name)))
+            # Normalize columns
+            def col(df, name):
+                return df[name] if name in df.columns else pd.Series([None]*len(df))
+
+            if replace_items:
+                # Clear all existing items
+                existing = get_items()
+                for it in existing:
+                    try:
+                        delete_item(it["sku"])
+                    except Exception:
+                        pass
+
+            added_items = 0
+            for _, r in inv_df.iterrows():
+                try:
+                    add_or_update_item({
+                        "sku": str(r.get("sku") or "").strip(),
+                        "name": str(r.get("name") or "").strip(),
+                        "category": (r.get("category") if pd.notna(r.get("category")) else None),
+                        "location": (r.get("location") if pd.notna(r.get("location")) else None),
+                        "unit": (r.get("unit") if pd.notna(r.get("unit")) else None),
+                        "quantity": float(r.get("quantity") or 0),
+                        "min_qty": float(r.get("min_qty") or 0),
+                        "unit_cost": float(r.get("unit_cost") or 0),
+                        "notes": (r.get("notes") if pd.notna(r.get("notes")) else None),
+                        "image_path": None,
+                    })
+                    added_items += 1
+                except Exception as e:
+                    st.warning(f"Item restore skipped for SKU={r.get('sku')}: {e}")
+
+            added_tx = 0
+            if append_tx and tx_name:
+                tx_df = pd.read_csv(io.BytesIO(zf.read(tx_name)))
+                existing_tx = get_transactions(limit=1_000_000) if skip_dup else []
+                existing_keys = set()
+                if skip_dup:
+                    for t in existing_tx:
+                        key = (
+                            str(t.get("sku") or ""),
+                            float(t.get("qty_change") or 0.0),
+                            str(t.get("reason") or ""),
+                            str(t.get("project") or ""),
+                            str(t.get("reference") or ""),
+                            str(t.get("user") or ""),
+                            str(t.get("notes") or ""),
+                        )
+                        existing_keys.add(key)
+
+                for _, r in tx_df.iterrows():
+                    key = (
+                        str(r.get("sku") or ""),
+                        float(r.get("qty_change") or 0.0),
+                        str(r.get("reason") or ""),
+                        str(r.get("project") or ""),
+                        str(r.get("reference") or ""),
+                        str(r.get("user") or ""),
+                        str(r.get("notes") or ""),
+                    )
+                    if skip_dup and key in existing_keys:
+                        continue
+                    try:
+                        # Note: timestamp in DB will be "now"; snapshot ts can't be preserved with current API.
+                        add_transaction(
+                            key[0], key[1], key[2], key[3], key[4], key[5], key[6]
+                        )
+                        added_tx += 1
+                    except Exception as e:
+                        st.warning(f"Transaction restore skipped for SKU={key[0]}: {e}")
+
+            st.success(f"Restore complete. Items loaded: {added_items}" + (f" | Transactions added: {added_tx}" if append_tx and tx_name else ""))
+            st.info("Tip: Save a new snapshot after restoring and updating.")
+        except Exception as e:
+            st.error(f"Restore failed: {e}")
 
     st.subheader("History")
     versions = get_versions()
