@@ -1,4 +1,8 @@
-# app.py — OMEC Stock Take (single-file) — Safe logo + Professional PDF exports (no CSV)
+# app.py — OMEC Stock Take (single-file)
+# Safe logo + Professional PDF exports (A3 Landscape) with:
+# - totals row (sum qty + total stock value)
+# - low-stock rows highlighted in red
+# - grouped inventory report by Category with subtotals
 import os, json, math
 import streamlit as st
 import pandas as pd
@@ -11,7 +15,7 @@ from db import (
 )
 from utils import export_snapshot, timestamp
 
-# PDF export (fpdf2) — safe import so app still runs if package missing
+# PDF export (fpdf2) — safe import so app still runs if the package is missing
 try:
     from fpdf import FPDF
     FPDF_AVAILABLE = True
@@ -20,7 +24,7 @@ except Exception:
 
 st.set_page_config(page_title="OMEC Stock Take", page_icon="🗃️", layout="wide")
 
-# ---------- Config ------------------------------------------------------------
+# ---------- Config ----------
 ROOT = os.path.dirname(__file__)
 CONFIG_PATH = os.path.join(ROOT, "config.json")
 if os.path.exists(CONFIG_PATH):
@@ -31,16 +35,14 @@ else:
 
 init_db()  # ensure SQLite schema exists
 
-# ---------- Helpers -----------------------------------------------------------
+# ---------- Helpers ----------
 def _norm_path(p: str) -> str:
-    """Absolute path from project root; '' if invalid."""
     if not isinstance(p, str) or not p.strip():
         return ""
     p = os.path.normpath(p)
     return p if os.path.isabs(p) else os.path.join(ROOT, p)
 
 def safe_show_logo(path: str):
-    """Show logo if file exists; never crash."""
     try:
         apath = _norm_path(path)
         if apath and os.path.exists(apath):
@@ -49,7 +51,6 @@ def safe_show_logo(path: str):
         pass
 
 def hex_to_rgb(h: str):
-    """#RRGGBB -> (r,g,b)."""
     try:
         h = h.lstrip("#")
         return tuple(int(h[i:i+2], 16) for i in (0, 2, 4))
@@ -57,7 +58,6 @@ def hex_to_rgb(h: str):
         return (14, 165, 233)  # fallback cyan-ish
 
 def lighten(rgb, factor=0.85):
-    """Lighten color toward white by factor (0-1)."""
     r, g, b = rgb
     return (int(r + (255 - r) * factor), int(g + (255 - g) * factor), int(b + (255 - b) * factor))
 
@@ -111,8 +111,227 @@ if FPDF_AVAILABLE:
             self.set_text_color(80, 80, 80)
             self.cell(0, 6, f"Page {self.page_no()}", align="R")
 
+# --- PDF utils (inventory grouped/subtotals/low-stock highlighting) ----------
 def _text_lines_needed(pdf, w, txt, line_h):
-    # crude wrap estimate based on string width
+    if txt is None:
+        return 1
+    s = str(txt)
+    if not s:
+        return 1
+    # crude wrap estimate
+    char_w = max(pdf.get_string_width("M"), 1e-6)
+    max_chars = max(int((w - 2) / (char_w if char_w else 1)), 1)
+    return max(1, math.ceil(len(s) / max(1, max_chars)))
+
+def _compute_col_widths(pdf, columns, rows, page_w, font_size):
+    pdf.set_font("Helvetica", "B", font_size)
+    widths = []
+    for c in columns:
+        max_w = pdf.get_string_width(str(c)) + 6
+        pdf.set_font("Helvetica", "", font_size)
+        for r in rows:
+            w = pdf.get_string_width(str(r.get(c, ""))) + 6
+            if w > max_w:
+                max_w = w
+        max_w = max(18, min(max_w, 80))
+        widths.append(max_w)
+    total_w = sum(widths)
+    if total_w > page_w:
+        scale = page_w / total_w
+        widths = [w * scale for w in widths]
+    else:
+        extra = page_w - total_w
+        if extra > 0 and len(widths) > 0:
+            bump = extra / len(widths)
+            widths = [w + bump for w in widths]
+    return widths
+
+def _draw_header_row(pdf, columns, widths, font_size, brand_rgb):
+    pdf.set_font("Helvetica", "B", font_size)
+    pdf.set_fill_color(*lighten(brand_rgb, 0.85))
+    pdf.set_text_color(20, 20, 20)
+    row_h = 7
+    y0 = pdf.get_y()
+    for w, col in zip(widths, columns):
+        x = pdf.get_x()
+        pdf.multi_cell(w, row_h, str(col), border=1, align="L", fill=True, new_x="RIGHT", new_y="TOP")
+        pdf.set_xy(x + w, y0)
+    pdf.ln(row_h)
+    return row_h
+
+def _ensure_page_space(pdf, needed_h, columns, widths, font_size, brand_rgb):
+    if pdf.get_y() + needed_h <= pdf.h - pdf.b_margin:
+        return
+    pdf.add_page()
+    _draw_header_row(pdf, columns, widths, font_size, brand_rgb)
+
+def _draw_row(pdf, values, widths, row_h, align_map=None, fill_rgb=None, bold=False, text_rgb=(15,15,15)):
+    if align_map is None:
+        align_map = {}
+    pdf.set_font("Helvetica", "B" if bold else "", 9)
+    if fill_rgb:
+        pdf.set_fill_color(*fill_rgb)
+    pdf.set_text_color(*text_rgb)
+
+    y_start = pdf.get_y()
+    heights = []
+    for w, v in zip(widths, values):
+        lines = _text_lines_needed(pdf, w, v, row_h)
+        heights.append(lines * row_h)
+    max_h = max(heights) if heights else row_h
+
+    # draw cells
+    x_left = pdf.get_x()
+    for idx, (w, v) in enumerate(zip(widths, values)):
+        x = pdf.get_x()
+        align = align_map.get(idx, "L")
+        if fill_rgb:
+            pdf.set_fill_color(*fill_rgb)
+            pdf.multi_cell(w, row_h, str(v if v is not None else ""), border=1, align=align,
+                           new_x="RIGHT", new_y="TOP", fill=True)
+        else:
+            pdf.multi_cell(w, row_h, str(v if v is not None else ""), border=1, align=align,
+                           new_x="RIGHT", new_y="TOP")
+        pdf.set_xy(x + w, y_start)
+    pdf.set_xy(x_left, y_start + max_h)
+
+def _inventory_pdf_bytes_grouped(df: pd.DataFrame, brand_name, brand_rgb, logo_path) -> bytes:
+    # Derive value column
+    df = df.copy()
+    df["quantity"] = pd.to_numeric(df.get("quantity"), errors="coerce").fillna(0.0)
+    df["min_qty"] = pd.to_numeric(df.get("min_qty"), errors="coerce").fillna(0.0)
+    df["unit_cost"] = pd.to_numeric(df.get("unit_cost"), errors="coerce").fillna(0.0)
+    df["value"] = (df["quantity"] * df["unit_cost"]).round(2)
+
+    # Order & rename for display
+    key_cols = ["sku", "name", "category", "location", "unit", "quantity", "min_qty", "unit_cost", "value", "updated_at"]
+    present = [c for c in key_cols if c in df.columns]
+    df = df[present]
+
+    col_names = {
+        "sku": "SKU", "name": "Name", "category": "Category", "location": "Location",
+        "unit": "Unit", "quantity": "Qty", "min_qty": "Min", "unit_cost": "Unit Cost (R)",
+        "value": "Value (R)", "updated_at": "Updated"
+    }
+    display_cols = [col_names.get(c, c) for c in present]
+
+    # Format rows for width estimation
+    def fmt_num(x, places=2): return f"{x:,.{places}f}"
+    rows_for_width = []
+    for _, r in df.iterrows():
+        row = {}
+        for c in present:
+            v = r[c]
+            if c in ("quantity", "min_qty"):
+                v = fmt_num(float(v), 2)
+            elif c in ("unit_cost", "value"):
+                v = fmt_num(float(v), 2)
+            row[col_names.get(c, c)] = "" if v is None else str(v)
+        rows_for_width.append(row)
+
+    # Build PDF
+    pdf = BrandedPDF(brand_name=brand_name, brand_rgb=brand_rgb, logo_path=logo_path,
+                     orientation="L", unit="mm", format="A3")
+    pdf.add_page()
+    pdf.set_text_color(30, 30, 30)
+
+    # Title + meta
+    pdf.set_font("Helvetica", "B", 16)
+    pdf.cell(0, 10, "Inventory Report", ln=1)
+    pdf.set_font("Helvetica", "", 10)
+    pdf.cell(0, 6, f"Rows: {len(df)}", ln=1)
+    pdf.ln(2)
+
+    page_w = pdf.w - pdf.l_margin - pdf.r_margin
+    widths = _compute_col_widths(pdf, display_cols, rows_for_width, page_w, font_size=9)
+    header_h = _draw_header_row(pdf, display_cols, widths, 9, brand_rgb)
+
+    # Alignment (numbers right aligned)
+    align_map = {present.index(c): "R" for c in present if c in ("quantity", "min_qty", "unit_cost", "value")}
+
+    # Group by category
+    if "category" in df.columns:
+        df_sorted = df.sort_values(by=["category", "sku", "name"], kind="stable")
+        categories = df_sorted["category"].fillna("(Unspecified)").unique().tolist()
+    else:
+        df_sorted = df.copy()
+        df_sorted["category"] = "(All)"
+        categories = ["(All)"]
+
+    light_brand = lighten(brand_rgb, 0.92)
+    cat_bar = lighten(brand_rgb, 0.80)
+    low_stock_fill = (255, 235, 235)
+
+    grand_qty = 0.0
+    grand_value = 0.0
+
+    for cat in categories:
+        block = df_sorted[df_sorted["category"].fillna("(Unspecified)") == cat]
+
+        # Category bar
+        span_h = 7
+        _ensure_page_space(pdf, span_h + header_h, display_cols, widths, 9, brand_rgb)
+        pdf.set_font("Helvetica", "B", 11)
+        pdf.set_fill_color(*cat_bar)
+        pdf.set_text_color(30, 30, 30)
+        pdf.cell(sum(widths), span_h, f"Category: {cat}", border=1, ln=1, fill=True)
+
+        cat_qty = float(block["quantity"].sum())
+        cat_value = float((block["quantity"] * block["unit_cost"]).sum())
+        grand_qty += cat_qty
+        grand_value += cat_value
+
+        # Rows
+        for _, r in block.iterrows():
+            vals = []
+            for c in present:
+                v = r[c]
+                if c in ("quantity", "min_qty"):
+                    v = fmt_num(float(v), 2)
+                elif c in ("unit_cost", "value"):
+                    v = fmt_num(float(v), 2)
+                vals.append(v if v is not None else "")
+            # low-stock highlight
+            fill = low_stock_fill if float(r["quantity"]) < float(r["min_qty"]) else None
+            row_h = 7
+            _ensure_page_space(pdf, row_h + 2, display_cols, widths, 9, brand_rgb)
+            _draw_row(pdf, vals, widths, row_h, align_map=align_map, fill_rgb=fill)
+
+        # Category subtotal
+        sub_vals = []
+        for c in present:
+            if c == "sku":
+                sub_vals.append("Subtotal")
+            elif c == "quantity":
+                sub_vals.append(fmt_num(cat_qty, 2))
+            elif c == "value":
+                sub_vals.append(fmt_num(cat_value, 2))
+            else:
+                sub_vals.append("")
+        _ensure_page_space(pdf, 7, display_cols, widths, 9, brand_rgb)
+        _draw_row(pdf, sub_vals, widths, 7, align_map=align_map, fill_rgb=light_brand, bold=True)
+
+        pdf.ln(1)
+
+    # Grand total row
+    total_vals = []
+    for c in present:
+        if c == "sku":
+            total_vals.append("TOTAL")
+        elif c == "quantity":
+            total_vals.append(f"{grand_qty:,.2f}")
+        elif c == "value":
+            total_vals.append(f"{grand_value:,.2f}")
+        else:
+            total_vals.append("")
+    _ensure_page_space(pdf, 8, display_cols, widths, 9, brand_rgb)
+    _draw_row(pdf, total_vals, widths, 8, align_map=align_map, fill_rgb=lighten(brand_rgb, 0.88), bold=True)
+
+    data = pdf.output(dest="S")
+    return bytes(data) if isinstance(data, (bytes, bytearray)) else str(data).encode("latin-1", errors="ignore")
+
+# Generic table (used for Transactions PDF)
+def _text_lines_needed_table(pdf, w, txt, line_h):
     if not txt:
         return 1
     char_w = max(pdf.get_string_width("M"), 1e-6)
@@ -120,13 +339,11 @@ def _text_lines_needed(pdf, w, txt, line_h):
     return max(1, math.ceil(len(str(txt)) / max(1, max_chars)))
 
 def draw_table(pdf, df: pd.DataFrame, header_fill_rgb: tuple, col_order=None, col_rename=None, font_size=9):
-    """Draw a table across pages with auto column widths and wrapped cells (fpdf2)."""
     if col_order is not None:
         df = df.loc[:, [c for c in col_order if c in df.columns]]
     if col_rename:
         df = df.rename(columns=col_rename)
 
-    # Column widths based on header + sample rows
     pdf.set_font("Helvetica", "B", font_size)
     page_w = pdf.w - pdf.l_margin - pdf.r_margin
     measure_rows = min(len(df), 200)
@@ -139,7 +356,7 @@ def draw_table(pdf, df: pd.DataFrame, header_fill_rgb: tuple, col_order=None, co
             w = pdf.get_string_width(str(df.iloc[i][col])) + 6
             if w > max_w:
                 max_w = w
-        max_w = max(18, min(max_w, 70))
+        max_w = max(18, min(max_w, 80))
         widths.append(max_w)
 
     total_w = sum(widths)
@@ -169,15 +386,12 @@ def draw_table(pdf, df: pd.DataFrame, header_fill_rgb: tuple, col_order=None, co
     pdf.set_text_color(15, 15, 15)
     for idx in range(len(df)):
         y_start = pdf.get_y()
-
-        # compute row height by estimating line counts for each cell
         heights = []
         for w, val in zip(widths, df.iloc[idx].tolist()):
-            lines = _text_lines_needed(pdf, w, str(val), row_h)
+            lines = _text_lines_needed_table(pdf, w, str(val), row_h)
             heights.append(lines * row_h)
         max_h = max(heights) if heights else row_h
 
-        # page break
         if y_start + max_h > pdf.h - pdf.b_margin:
             pdf.add_page()
             # redraw header
@@ -194,7 +408,6 @@ def draw_table(pdf, df: pd.DataFrame, header_fill_rgb: tuple, col_order=None, co
             pdf.set_text_color(15, 15, 15)
             y_start = pdf.get_y()
 
-        # draw row
         x_left = pdf.get_x()
         for w, val in zip(widths, df.iloc[idx].tolist()):
             txt = str(val)
@@ -203,41 +416,29 @@ def draw_table(pdf, df: pd.DataFrame, header_fill_rgb: tuple, col_order=None, co
             pdf.set_xy(x + w, y_start)
         pdf.set_xy(x_left, y_start + max_h)
 
-def df_to_pdf_bytes_pro(
-    title: str,
-    df: pd.DataFrame,
-    meta_lines,
-    brand_name: str,
-    brand_rgb: tuple,
-    logo_path: str
-) -> bytes:
+def df_to_pdf_bytes_pro(title: str, df: pd.DataFrame, meta_lines, brand_name: str, brand_rgb: tuple, logo_path: str) -> bytes:
     pdf = BrandedPDF(brand_name=brand_name, brand_rgb=brand_rgb, logo_path=logo_path,
-                     orientation="L", unit="mm", format="A4")
+                     orientation="L", unit="mm", format="A3")
     pdf.add_page()
     pdf.set_text_color(30, 30, 30)
-    pdf.set_font("Helvetica", "B", 15)
-    pdf.ln(2)
-    pdf.cell(0, 8, txt=title, ln=1)
+    pdf.set_font("Helvetica", "B", 16)
+    pdf.cell(0, 10, txt=title, ln=1)
     pdf.set_font("Helvetica", "", 10)
     for line in meta_lines:
         pdf.cell(0, 6, txt=str(line), ln=1)
     pdf.ln(2)
     draw_table(pdf, df, header_fill_rgb=brand_rgb, font_size=9)
 
-    # Return bytes (fpdf2 returns bytes/bytearray for dest='S')
     data = pdf.output(dest="S")
-    if isinstance(data, (bytes, bytearray)):
-        return bytes(data)
-    # fallback for older libs returning str
-    return str(data).encode("latin-1", errors="ignore")
+    return bytes(data) if isinstance(data, (bytes, bytearray)) else str(data).encode("latin-1", errors="ignore")
 
-# ---------- Settings (with config defaults) -----------------------------------
+# ---------- Settings (with config defaults) ----------
 logo_path = get_setting("logo_path", CONFIG.get("logo_path", ""))
 brand_name = get_setting("brand_name", CONFIG.get("brand_name", "OMEC"))
 brand_color = get_setting("brand_color", CONFIG.get("brand_color", "#0ea5e9"))
 brand_rgb = hex_to_rgb(brand_color)
 
-# ---------- Sidebar -----------------------------------------------------------
+# ---------- Sidebar ----------
 st.sidebar.markdown(
     f"<h2 style='color:{brand_color}; margin-bottom:0'>{brand_name}</h2>",
     unsafe_allow_html=True
@@ -258,7 +459,7 @@ menu = st.sidebar.radio(
     index=0,
 )
 
-# ---------- Views -------------------------------------------------------------
+# ---------- Views ----------
 def view_dashboard():
     st.title("🏠 Dashboard")
     st.caption("Quick overview of your stock status.")
@@ -395,29 +596,19 @@ def view_versions():
 
 def view_reports():
     st.title("🧾 Reports & Export (PDF)")
-    st.caption("Generate branded PDF reports for inventory and transactions.")
+    st.caption("A3 landscape • group by category • subtotals • low-stock highlight • totals row")
 
     if not FPDF_AVAILABLE:
         st.error("PDF engine not available. Add `fpdf2==2.7.9` to requirements.txt.")
         return
 
-    # ---------- Inventory PDF ----------
+    # ---------- Inventory PDF (grouped) ----------
     st.subheader("Inventory Report")
     items = get_items()
     df_items = pd.DataFrame(items)
 
     if not df_items.empty:
-        col_order = ["sku", "name", "category", "location", "unit", "quantity", "min_qty", "unit_cost", "updated_at"]
-        col_names = {
-            "sku": "SKU", "name": "Name", "category": "Category", "location": "Location",
-            "unit": "Unit", "quantity": "Qty", "min_qty": "Min", "unit_cost": "Unit Cost (R)", "updated_at": "Updated",
-        }
-        pdf_bytes = df_to_pdf_bytes_pro(
-            "Inventory Report",
-            df_items.loc[:, [c for c in col_order if c in df_items.columns]].rename(columns=col_names),
-            [f"Rows: {len(df_items)}"],
-            brand_name, brand_rgb, logo_path
-        )
+        pdf_bytes = _inventory_pdf_bytes_grouped(df_items, brand_name, brand_rgb, logo_path)
         st.download_button(
             "Download Inventory PDF",
             data=pdf_bytes,
@@ -427,7 +618,7 @@ def view_reports():
     else:
         st.info("No items to include in the report.")
 
-    # ---------- Transactions PDF ----------
+    # ---------- Transactions PDF (simple table) ----------
     st.subheader("Transaction Log")
     tx = get_transactions(limit=100_000)
     df_tx = pd.DataFrame(tx)
@@ -438,9 +629,10 @@ def view_reports():
             "ts": "Timestamp", "sku": "SKU", "qty_change": "Δ Qty", "reason": "Reason",
             "project": "Project/Job", "reference": "Reference", "user": "User", "notes": "Notes",
         }
+        df_tx = df_tx.loc[:, [c for c in col_order if c in df_tx.columns]].rename(columns=col_names)
         pdf_bytes_tx = df_to_pdf_bytes_pro(
             "Transaction Log",
-            df_tx.loc[:, [c for c in col_order if c in df_tx.columns]].rename(columns=col_names),
+            df_tx,
             [f"Rows: {len(df_tx)}"],
             brand_name, brand_rgb, logo_path
         )
@@ -522,7 +714,7 @@ def view_settings():
         upsert_setting("logo_path", "assets/logo_OMEC.png")
         st.success("Default branding applied. Refresh to see it.")
 
-# ---------- Router ------------------------------------------------------------
+# ---------- Router ----------
 if menu == "Dashboard":
     view_dashboard()
 elif menu == "Inventory":
