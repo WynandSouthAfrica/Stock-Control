@@ -1,13 +1,6 @@
 # app.py — OMEC Stock Take (single-file)
-# Features:
-# - Inventory filter + bulk edit
-# - Dashboard low-stock & category totals
-# - Reports: only-low-stock, sort-by, category multi-select, only-available
-# - Transactions filters
-# - Settings: Prepared-by + Rev++ button
-# - Snapshots: Create ZIP + **Restore from ZIP** (replace items, optional append transactions)
-# - PDFs: A3 landscape, grouped subtotals, totals row, Notes column, NO GAPS
-# - PDF text sanitized to latin-1 (fix FPDFUnicodeEncodingException)
+# Restore fix: accept inventory/items*.csv and transactions/trans*.csv in snapshot ZIP
+# (The rest of the app is the same feature set we built.)
 
 import os, json, math, re, io, zipfile
 import streamlit as st
@@ -76,14 +69,13 @@ def rev_bump(tag: str) -> str:
     return f"Rev{major}.{minor}"
 
 def to_latin1(x) -> str:
-    """Return a string that is safe for core PDF fonts (latin-1)."""
     if x is None:
         return ""
     if not isinstance(x, str):
         x = str(x)
     return x.encode("latin-1", "replace").decode("latin-1")
 
-# ---------- Settings (with config defaults) ----------
+# ---------- Settings ----------
 logo_path = get_setting("logo_path", CONFIG.get("logo_path", ""))
 brand_name = get_setting("brand_name", CONFIG.get("brand_name", "OMEC"))
 brand_color = get_setting("brand_color", CONFIG.get("brand_color", "#0ea5e9"))
@@ -112,7 +104,7 @@ menu = st.sidebar.radio(
     index=0,
 )
 
-# ---------- PDF classes & helpers ----------
+# ---------- PDF helpers ----------
 if FPDF_AVAILABLE:
     class BrandedPDF(FPDF):
         def __init__(self, brand_name: str, brand_rgb: tuple, logo_path: str = "", revision_tag: str = "Rev0.1", *args, **kwargs):
@@ -234,6 +226,7 @@ def _draw_row(pdf, values, widths, row_h, align_map=None, fill_rgb=None, bold=Fa
         pdf.set_xy(x + w, y_start)
     pdf.set_xy(x_left, y_start + max_h)
 
+# ---------- PDF Inventory ----------
 def _inventory_pdf_bytes_grouped(
     df: pd.DataFrame,
     brand_name, brand_rgb, logo_path, revision_tag,
@@ -436,7 +429,6 @@ def view_inventory():
     st.title("📦 Inventory")
     st.caption("Add, edit, or delete items.")
 
-    # Quick filter
     items = get_items()
     df = pd.DataFrame(items)
     filt = st.text_input("Filter (SKU/Name/Category/Location contains…)")
@@ -616,22 +608,27 @@ def view_versions():
     if up and st.button("Restore now"):
         try:
             zf = zipfile.ZipFile(io.BytesIO(up.read()))
-            names = {n.lower(): n for n in zf.namelist()}
-            inv_name = next((names[n] for n in names if n.endswith("inventory.csv")), None)
-            tx_name  = next((names[n] for n in names if n.endswith("transactions.csv")), None)
+            all_names = zf.namelist()
+
+            # Flexible finders
+            def find_csv(candidates):
+                for n in all_names:
+                    ln = n.lower()
+                    if ln.endswith(".csv") and any(k in ln for k in candidates):
+                        return n
+                return None
+
+            inv_name = find_csv(["inventory", "items"])
+            tx_name  = find_csv(["transactions", "transaction", "trans"])
 
             if not inv_name:
-                st.error("inventory.csv not found in ZIP.")
+                st.error("inventory.csv (or items*.csv) not found in ZIP.\n\nFiles in ZIP:\n" + "\n".join(all_names))
                 return
 
-            # Load inventory
+            # Load inventory CSV
             inv_df = pd.read_csv(io.BytesIO(zf.read(inv_name)))
-            # Normalize columns
-            def col(df, name):
-                return df[name] if name in df.columns else pd.Series([None]*len(df))
 
             if replace_items:
-                # Clear all existing items
                 existing = get_items()
                 for it in existing:
                     try:
@@ -689,7 +686,6 @@ def view_versions():
                     if skip_dup and key in existing_keys:
                         continue
                     try:
-                        # Note: timestamp in DB will be "now"; snapshot ts can't be preserved with current API.
                         add_transaction(
                             key[0], key[1], key[2], key[3], key[4], key[5], key[6]
                         )
@@ -721,9 +717,8 @@ def view_reports():
     items = get_items()
     df_items = pd.DataFrame(items)
 
-    # Manager-friendly filters
     categories = sorted([c for c in df_items.get("category", pd.Series(dtype=str)).dropna().unique().tolist()])
-    cat_select = st.multiselect("Categories to include", options=categories, default=categories, help="Choose what the manager wants to see (e.g., Paint, Steel Plates).")
+    cat_select = st.multiselect("Categories to include", options=categories, default=categories)
     only_available = st.checkbox("Only available items (> 0 qty)", value=False)
     only_low = st.checkbox("Only low-stock rows", value=False)
     sort_by = st.selectbox("Sort by", options=["category","sku","name"], index=0)
@@ -751,7 +746,6 @@ def view_reports():
         st.info("No transactions to include in the report.")
         return
 
-    # simple PDF table
     def df_to_pdf_bytes_pro(title: str, df: pd.DataFrame, meta_lines, brand_name: str, brand_rgb: tuple, logo_path: str, revision_tag: str) -> bytes:
         pdf = BrandedPDF(
             brand_name=brand_name, brand_rgb=brand_rgb, logo_path=logo_path, revision_tag=revision_tag,
@@ -834,21 +828,14 @@ def view_reports():
         return bytes(data) if isinstance(data, (bytes, bytearray)) else str(data).encode("latin-1", errors="ignore")
 
     col_order = ["ts", "sku", "qty_change", "reason", "project", "reference", "user", "notes"]
-    col_names = {
-        "ts": "Timestamp", "sku": "SKU", "qty_change": "Δ Qty", "reason": "Reason",
-        "project": "Project/Job", "reference": "Reference", "user": "User", "notes": "Notes",
-    }
+    col_names = {"ts":"Timestamp","sku":"SKU","qty_change":"Δ Qty","reason":"Reason","project":"Project/Job","reference":"Reference","user":"User","notes":"Notes"}
+    df_tx = pd.DataFrame(tx)
     df_tx = df_tx.loc[:, [c for c in col_order if c in df_tx.columns]].rename(columns=col_names)
     meta = [f"Rows: {len(df_tx)}"]
     if prepared_by:
         meta.append(f"Prepared by: {prepared_by}")
     pdf_bytes_tx = df_to_pdf_bytes_pro("Transaction Log", df_tx, meta, brand_name, brand_rgb, logo_path, revision_tag)
-    st.download_button(
-        "Download Transactions PDF",
-        data=pdf_bytes_tx,
-        file_name=f"transactions_{timestamp()}.pdf",
-        mime="application/pdf",
-    )
+    st.download_button("Download Transactions PDF", data=pdf_bytes_tx, file_name=f"transactions_{timestamp()}.pdf", mime="application/pdf")
 
 def view_maintenance():
     st.title("🛠️ Maintenance (Lightweight)")
@@ -872,9 +859,7 @@ def view_maintenance():
             if not sku or qty_used >= 0:
                 st.error("Choose a SKU and enter a negative quantity to deduct.")
             else:
-                add_transaction(
-                    sku, qty_used, reason="maintenance", project=project, reference="", user=user, notes=notes
-                )
+                add_transaction(sku, qty_used, reason="maintenance", project=project, reference="", user=user, notes=notes)
                 st.success("Maintenance usage logged (stock deducted).")
 
 def view_settings():
