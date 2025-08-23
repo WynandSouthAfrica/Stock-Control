@@ -1,8 +1,8 @@
 # app.py — OMEC Stock Take (single-file)
-# Polished build:
+# Polished build + Manager filters:
 # - Inventory filter + bulk edit
 # - Dashboard low-stock & category totals
-# - Reports: only-low-stock + sort-by controls
+# - Reports: only-low-stock, sort-by, **category multi-select**, only-available
 # - Transactions filters
 # - Settings: Prepared-by + Rev++ button
 # - PDFs remain A3 landscape, grouped subtotals, totals row, Notes column, NO GAPS
@@ -224,13 +224,22 @@ def _draw_row(pdf, values, widths, row_h, align_map=None, fill_rgb=None, bold=Fa
         pdf.set_xy(x + w, y_start)
     pdf.set_xy(x_left, y_start + max_h)
 
-def _inventory_pdf_bytes_grouped(df: pd.DataFrame, brand_name, brand_rgb, logo_path, revision_tag, prepared_by: str, only_low: bool, sort_by: str) -> bytes:
+def _inventory_pdf_bytes_grouped(
+    df: pd.DataFrame,
+    brand_name, brand_rgb, logo_path, revision_tag,
+    prepared_by: str, only_low: bool, sort_by: str,
+    categories=None, only_available: bool=False
+) -> bytes:
     df = df.copy()
     df["quantity"] = pd.to_numeric(df.get("quantity"), errors="coerce").fillna(0.0)
     df["min_qty"] = pd.to_numeric(df.get("min_qty"), errors="coerce").fillna(0.0)
     df["unit_cost"] = pd.to_numeric(df.get("unit_cost"), errors="coerce").fillna(0.0)
     df["value"] = (df["quantity"] * df["unit_cost"]).round(2)
 
+    if categories and "category" in df.columns:
+        df = df[df["category"].isin(categories)]
+    if only_available:
+        df = df[df["quantity"] > 0]
     if only_low:
         df = df[df["quantity"] < df["min_qty"]]
 
@@ -277,7 +286,14 @@ def _inventory_pdf_bytes_grouped(df: pd.DataFrame, brand_name, brand_rgb, logo_p
     pdf.set_font("Helvetica", "B", 16)
     pdf.cell(0, 10, "Inventory Report", ln=1)
     pdf.set_font("Helvetica", "", 10)
+
     meta = [f"Rows: {len(df)}"]
+    if categories:
+        meta.append("Categories: " + ", ".join(categories))
+    if only_available:
+        meta.append("Only available (>0 qty)")
+    if only_low:
+        meta.append("Low-stock only")
     if prepared_by:
         meta.append(f"Prepared by: {prepared_by}")
     pdf.cell(0, 6, "  •  ".join(meta), ln=1)
@@ -293,11 +309,11 @@ def _inventory_pdf_bytes_grouped(df: pd.DataFrame, brand_name, brand_rgb, logo_p
 
     if "category" in df.columns:
         df_sorted = df.sort_values(by=["category", "sku", "name"], kind="stable")
-        categories = df_sorted["category"].fillna("(Unspecified)").unique().tolist()
+        categories_iter = df_sorted["category"].fillna("(Unspecified)").unique().tolist()
     else:
         df_sorted = df.copy()
         df_sorted["category"] = "(All)"
-        categories = ["(All)"]
+        categories_iter = ["(All)"]
 
     light_brand = lighten(brand_rgb, 0.92)
     cat_bar = lighten(brand_rgb, 0.80)
@@ -306,7 +322,7 @@ def _inventory_pdf_bytes_grouped(df: pd.DataFrame, brand_name, brand_rgb, logo_p
     grand_qty = 0.0
     grand_value = 0.0
 
-    for cat in categories:
+    for cat in categories_iter:
         block = df_sorted[df_sorted["category"].fillna("(Unspecified)") == cat]
 
         span_h = 7
@@ -594,13 +610,19 @@ def view_reports():
     items = get_items()
     df_items = pd.DataFrame(items)
 
+    # Manager-friendly filters
+    categories = sorted([c for c in df_items.get("category", pd.Series(dtype=str)).dropna().unique().tolist()])
+    cat_select = st.multiselect("Categories to include", options=categories, default=categories, help="Choose what the manager wants to see (e.g., Paint, Steel Plates).")
+    only_available = st.checkbox("Only available items (> 0 qty)", value=False)
     only_low = st.checkbox("Only low-stock rows", value=False)
     sort_by = st.selectbox("Sort by", options=["category","sku","name"], index=0)
 
     if not df_items.empty:
+        use_cats = cat_select if cat_select else None
         pdf_bytes = _inventory_pdf_bytes_grouped(
             df_items, brand_name, brand_rgb, logo_path, revision_tag,
-            prepared_by=prepared_by, only_low=only_low, sort_by=sort_by
+            prepared_by=prepared_by, only_low=only_low, sort_by=sort_by,
+            categories=use_cats, only_available=only_available
         )
         st.download_button(
             "Download Inventory PDF",
@@ -633,7 +655,6 @@ def view_reports():
             pdf.cell(0, 6, txt=str(line), ln=1)
         pdf.ln(2)
 
-        # draw table
         def draw_table(pdf, df: pd.DataFrame, header_fill_rgb: tuple, font_size=9):
             pdf.set_font("Helvetica", "B", font_size)
             page_w = pdf.w - pdf.l_margin - pdf.r_margin
@@ -673,12 +694,7 @@ def view_reports():
             pdf.set_text_color(15, 15, 15)
             for idx in range(len(df)):
                 y_start = pdf.get_y()
-                heights = []
-                for w, val in zip(widths, df.iloc[idx].tolist()):
-                    lines = 1
-                    heights.append(lines * row_h)
-                max_h = max(heights) if heights else row_h
-
+                max_h = row_h
                 if y_start + max_h > pdf.h - pdf.b_margin:
                     pdf.add_page()
                     pdf.set_font("Helvetica", "B", font_size)
@@ -700,7 +716,7 @@ def view_reports():
                     x = pdf.get_x()
                     pdf.multi_cell(w, row_h, txt, border=1, align="L", new_x="RIGHT", new_y="TOP")
                     pdf.set_xy(x + w, y_start)
-                pdf.set_xy(x_left, y_start + max_h)
+                pdf.set_xy(x_left, y_start + row_h)
 
         draw_table(pdf, df, brand_rgb, font_size=9)
         data = pdf.output(dest="S")
