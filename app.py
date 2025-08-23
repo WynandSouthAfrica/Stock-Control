@@ -1,6 +1,7 @@
 # app.py — OMEC Stock Take (Streamlit)
-# Big update: site profiles (snapshot-based), robust restore, sign-off in PDFs,
-# auto-backup, low-stock email helper (fixed), unit conversions, strong editing UX.
+# Features: site profiles (snapshot-based), robust restore, sign-off in PDFs,
+# auto-backup, low-stock email helper, unit conversions, strong editing UX,
+# and **CATEGORY NORMALIZATION** to avoid duplicate category buckets.
 
 import os, json, re, io, zipfile, glob, datetime as dt, urllib.parse
 import streamlit as st
@@ -81,6 +82,17 @@ def rev_bump(tag: str) -> str:
 def get_bool_setting(name: str, default: bool) -> bool:
     raw = str(get_setting(name, str(default))).strip().lower()
     return raw in {"1", "true", "yes", "y", "on"}
+
+# --- NEW: Category normalization everywhere ---
+def normalize_category(cat):
+    """Trim, collapse spaces, Title Case. None stays None."""
+    if cat is None:
+        return None
+    s = str(cat).strip()
+    if not s:
+        return None
+    s = re.sub(r"\s+", " ", s)   # collapse multiple spaces
+    return s.title()
 
 # ---------- Settings (with config defaults) ----------
 logo_path = get_setting("logo_path", CONFIG.get("logo_path", ""))
@@ -262,6 +274,10 @@ def _inventory_pdf_bytes_grouped(
     only_low: bool, sort_by: str, categories=None, only_available: bool=False
 ) -> bytes:
     df = df.copy()
+    # Normalize categories for grouping/printing
+    if "category" in df.columns:
+        df["category"] = df["category"].apply(normalize_category)
+
     # Unit conversion (optional columns: convert_to, convert_factor)
     df["quantity"] = pd.to_numeric(df.get("quantity"), errors="coerce").fillna(0.0)
     df["min_qty"] = pd.to_numeric(df.get("min_qty"), errors="coerce").fillna(0.0)
@@ -451,6 +467,8 @@ def view_dashboard():
     st.caption("Quick overview of your stock status with low-stock email helper.")
     items = get_items()
     df = pd.DataFrame(items)
+    if "category" in df.columns:
+        df["category"] = df["category"].apply(normalize_category)
 
     col1, col2, col3, col4 = st.columns(4)
     total_items = len(items)
@@ -510,6 +528,8 @@ def view_inventory():
 
     items = get_items()
     df = pd.DataFrame(items)
+    if "category" in df.columns:
+        df["category"] = df["category"].apply(normalize_category)
 
     # Quick filter
     filt = st.text_input("Filter (SKU/Name/Category/Location contains…)")
@@ -548,7 +568,7 @@ def view_inventory():
                 add_or_update_item({
                     "sku": sku.strip(),
                     "name": name.strip(),
-                    "category": category.strip() if category else None,
+                    "category": normalize_category(category),
                     "location": location.strip() if location else None,
                     "unit": unit.strip() if unit else None,
                     "quantity": float(quantity),
@@ -585,7 +605,7 @@ def view_inventory():
                 add_or_update_item({
                     "sku": r.get("sku"),
                     "name": r.get("name"),
-                    "category": r.get("category"),
+                    "category": normalize_category(r.get("category")),
                     "location": r.get("location"),
                     "unit": r.get("unit"),
                     "quantity": float(r.get("quantity") or 0),
@@ -627,7 +647,7 @@ def view_inventory():
                 add_or_update_item({
                     "sku": sku_pick,
                     "name": q_name,
-                    "category": q_cat or None,
+                    "category": normalize_category(q_cat),
                     "location": q_loc or None,
                     "unit": q_unit or None,
                     "quantity": float(q_qty),
@@ -820,7 +840,7 @@ def _restore_from_bytes(zip_bytes: bytes, replace_items: bool, append_tx: bool, 
             add_or_update_item({
                 "sku": str(r.get("sku") or "").strip(),
                 "name": str(r.get("name") or "").strip(),
-                "category": (r.get("category") if pd.notna(r.get("category")) else None),
+                "category": normalize_category(r.get("category")),
                 "location": (r.get("location") if pd.notna(r.get("location")) else None),
                 "unit": (r.get("unit") if pd.notna(r.get("unit")) else None),
                 "quantity": float(r.get("quantity") or 0),
@@ -868,7 +888,6 @@ def _restore_from_bytes(zip_bytes: bytes, replace_items: bool, append_tx: bool, 
             if skip_dup and key in existing_keys:
                 continue
             try:
-                # Try preserving timestamp if DB supports it
                 if preserve_ts:
                     try:
                         add_transaction(key[0], key[1], key[2], key[3], key[4], key[5], key[6], ts=key[7])
@@ -893,6 +912,8 @@ def view_reports():
     st.subheader("Inventory Report")
     items = get_items()
     df_items = pd.DataFrame(items)
+    if "category" in df_items.columns:
+        df_items["category"] = df_items["category"].apply(normalize_category)
 
     categories = sorted([c for c in df_items.get("category", pd.Series(dtype=str)).dropna().unique().tolist()])
     cat_select = st.multiselect("Categories to include", options=categories, default=categories)
