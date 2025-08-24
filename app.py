@@ -12,11 +12,15 @@ from datetime import datetime
 import pandas as pd
 import streamlit as st
 
+# ----------------------------- App Config ----------------------------------- #
 APP_TITLE = "OMEC • Stock Controller"
-DATA_PATH = Path("inventory_data.json")
+st.set_page_config(page_title=APP_TITLE, page_icon="🧰", layout="wide")
 
-LOGO_OMEC = "/mnt/data/Logo R0.1.png"
-LOGO_PGB = "/mnt/data/PG Bison.jpg"
+# Prefer local assets; fall back to containers (works both locally & on Streamlit Cloud)
+LOGO_OMEC_CANDIDATES = ["assets/logo_OMEC.png", "/mnt/data/Logo R0.1.png"]
+LOGO_PGB_CANDIDATES = ["assets/logo_PG_Bison.png", "/mnt/data/PG Bison.jpg"]
+
+DATA_PATH = Path("inventory_data.json")
 
 # ----------------------------- Session init --------------------------------- #
 def init_state():
@@ -27,22 +31,38 @@ def init_state():
 init_state()
 
 # ----------------------------- Utilities ------------------------------------ #
+def first_existing(paths: List[str]) -> str | None:
+    for p in paths:
+        try:
+            if Path(p).exists():
+                return p
+        except Exception:
+            pass
+    return None
+
+LOGO_OMEC = first_existing(LOGO_OMEC_CANDIDATES)
+LOGO_PGB = first_existing(LOGO_PGB_CANDIDATES)
+
+def safe_image(path: str | None, *, use_column_width: bool = False):
+    """Show an image only if the path exists (prevents MediaFileStorageError)."""
+    if not path:
+        return False
+    try:
+        st.image(path, use_column_width=use_column_width)
+        return True
+    except Exception:
+        return False
+
 def page_header(title: str, subtitle: str = ""):
     cols = st.columns([1, 6, 1.2])
     with cols[0]:
-        try:
-            st.image(LOGO_OMEC, use_column_width=True)
-        except Exception:
-            st.write("")
+        safe_image(LOGO_OMEC, use_column_width=True)
     with cols[1]:
         st.title(title)
         if subtitle:
             st.caption(subtitle)
     with cols[2]:
-        try:
-            st.image(LOGO_PGB, use_column_width=True)
-        except Exception:
-            st.write("")
+        safe_image(LOGO_PGB, use_column_width=True)
 
 def timestamp() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -51,7 +71,6 @@ def push_history(df: pd.DataFrame):
     """Keep a small history stack for Undo."""
     try:
         st.session_state.df_history.append(df.to_json(orient="records", force_ascii=False))
-        # Limit history stack to last 10
         if len(st.session_state.df_history) > 10:
             st.session_state.df_history.pop(0)
     except Exception:
@@ -86,7 +105,6 @@ def load_data() -> pd.DataFrame:
     return df.copy()
 
 def save_data(df: pd.DataFrame, log_action: str | None = None, log_details: str | None = None):
-    # Push current state to history before saving new state
     if isinstance(st.session_state.get("items"), pd.DataFrame):
         push_history(st.session_state.items.copy())
     st.session_state.items = df.copy()
@@ -329,11 +347,9 @@ _This never deletes items. Categories are always derived from the items themselv
         else:
             st.caption("No activity yet.")
 
-# ----------------------------- App Layout ----------------------------------- #
-st.set_page_config(page_title=APP_TITLE, page_icon="🧰", layout="wide")
-
+# ----------------------------- Sidebar -------------------------------------- #
 with st.sidebar:
-    st.image(LOGO_OMEC)
+    safe_image(LOGO_OMEC, use_column_width=True)
     st.markdown("### OMEC • Stock Controller")
     page = st.radio(
         "Navigate",
@@ -343,7 +359,7 @@ with st.sidebar:
     )
     st.divider()
 
-    # Always show export
+    # Export always visible
     df_export = ensure_schema(load_data())
     st.download_button(
         "Download inventory_data.json",
@@ -369,6 +385,7 @@ with st.sidebar:
             save_data(empty, log_action="Clear Inventory", log_details="Start fresh")
             st.success("Inventory cleared.")
 
+# ----------------------------- Router --------------------------------------- #
 if page == "Inventory":
     inventory_page()
 else:
