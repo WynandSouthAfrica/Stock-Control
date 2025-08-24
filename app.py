@@ -16,7 +16,7 @@ import streamlit as st
 APP_TITLE = "OMEC • Stock Controller"
 st.set_page_config(page_title=APP_TITLE, page_icon="🧰", layout="wide")
 
-# Prefer local assets; fall back to container-mounted images
+# Prefer local assets; fall back to containers (works both locally & on Streamlit Cloud)
 LOGO_OMEC_CANDIDATES = ["assets/logo_OMEC.png", "/mnt/data/Logo R0.1.png"]
 LOGO_PGB_CANDIDATES = ["assets/logo_PG_Bison.png", "/mnt/data/PG Bison.jpg"]
 
@@ -24,12 +24,9 @@ DATA_PATH = Path("inventory_data.json")
 
 # ----------------------------- Session init --------------------------------- #
 def init_state():
-    if "items" not in st.session_state:
-        st.session_state.items = None
-    if "activity_log" not in st.session_state:
-        st.session_state.activity_log = []   # list[dict]
-    if "df_history" not in st.session_state:
-        st.session_state.df_history = []     # stack of JSON strings (for Undo)
+    st.session_state.setdefault("items", None)
+    st.session_state.setdefault("activity_log", [])  # list[dict]
+    st.session_state.setdefault("df_history", [])    # stack of JSON strings (for Undo)
 
 init_state()
 
@@ -44,9 +41,10 @@ def first_existing(paths: List[str]) -> str | None:
     return None
 
 LOGO_OMEC = first_existing(LOGO_OMEC_CANDIDATES)
-LOGO_PGB  = first_existing(LOGO_PGB_CANDIDATES)
+LOGO_PGB = first_existing(LOGO_PGB_CANDIDATES)
 
 def safe_image(path: str | None, *, use_column_width: bool = False):
+    """Show an image only if the path exists (prevents MediaFileStorageError)."""
     if not path:
         return False
     try:
@@ -70,6 +68,7 @@ def timestamp() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 def push_history(df: pd.DataFrame):
+    """Keep a small history stack for Undo."""
     try:
         st.session_state.df_history.append(df.to_json(orient="records", force_ascii=False))
         if len(st.session_state.df_history) > 10:
@@ -77,28 +76,13 @@ def push_history(df: pd.DataFrame):
     except Exception:
         pass
 
-def ensure_schema(df: pd.DataFrame) -> pd.DataFrame:
-    required = ["id", "name", "category", "qty", "location"]
-    for col in required:
-        if col not in df.columns:
-            if col == "id":
-                df[col] = [str(uuid.uuid4()) for _ in range(len(df))]
-            elif col == "qty":
-                df[col] = 0
-            else:
-                df[col] = ""
-    return df[required]
-
 def load_data() -> pd.DataFrame:
-    items = st.session_state.get("items", None)
-    if isinstance(items, pd.DataFrame):
-        return ensure_schema(items.copy())
+    if isinstance(st.session_state.get("items"), pd.DataFrame):
+        return st.session_state.items.copy()
 
-    # Load from disk
     if DATA_PATH.exists():
         try:
-            raw = DATA_PATH.read_text(encoding="utf-8")
-            data = json.loads(raw) if raw.strip() else []
+            data = json.loads(DATA_PATH.read_text(encoding="utf-8"))
             df = pd.DataFrame(data)
         except Exception:
             df = pd.DataFrame()
@@ -106,7 +90,7 @@ def load_data() -> pd.DataFrame:
         df = pd.DataFrame()
 
     if df.empty:
-        # Demo seed when nothing exists yet
+        # Demo seed
         df = pd.DataFrame(
             [
                 {"id": str(uuid.uuid4()), "name": "Cutting Discs 115mm", "category": "Consumables", "qty": 12, "location": "Stores A"},
@@ -117,28 +101,35 @@ def load_data() -> pd.DataFrame:
             ]
         )
 
-    df = ensure_schema(df)
-    st.session_state.items = df.copy()
+    st.session_state.items = df
     return df.copy()
 
 def save_data(df: pd.DataFrame, log_action: str | None = None, log_details: str | None = None):
-    df = ensure_schema(df.copy())
     if isinstance(st.session_state.get("items"), pd.DataFrame):
         push_history(st.session_state.items.copy())
     st.session_state.items = df.copy()
     DATA_PATH.write_text(df.to_json(orient="records", force_ascii=False, indent=2), encoding="utf-8")
+
     if log_action:
-        st.session_state.activity_log.append({"time": timestamp(), "action": log_action, "details": log_details or ""})
+        st.session_state.activity_log.append(
+            {"time": timestamp(), "action": log_action, "details": log_details or ""}
+        )
 
 def get_categories(df: pd.DataFrame) -> List[str]:
     if "category" not in df.columns:
         return []
-    return sorted({(c or "").strip() for c in df["category"].astype(str).tolist() if str(c).strip() != ""})
+    cats = sorted({(c or "").strip() for c in df["category"].astype(str).tolist() if str(c).strip() != ""})
+    return cats
 
 def collapse_spaces(s: str) -> str:
     return re.sub(r"\s+", " ", s).strip()
 
 def smart_title_case(s: str) -> str:
+    """
+    Title-case with light acronym protection:
+    - Leave tokens that are fully UPPER and length <= 4 (e.g., M12, E6013) as-is.
+    - Otherwise title-case each token (respect hyphens).
+    """
     tokens = collapse_spaces(s).split(" ")
     fixed = []
     for t in tokens:
@@ -165,19 +156,33 @@ def normalize_all_categories(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, 
     mapping = {}
     if "category" not in df.columns:
         return df, mapping
+
     cats_before = df["category"].astype(str).tolist()
     cats_after = [normalize_category_label(c) for c in cats_before]
     df = df.copy()
     df["category"] = cats_after
+
     for before, after in zip(cats_before, cats_after):
         if collapse_spaces(before) != collapse_spaces(after):
             mapping[before] = after
     return df, mapping
 
+def ensure_schema(df: pd.DataFrame) -> pd.DataFrame:
+    required = ["id", "name", "category", "qty", "location"]
+    for col in required:
+        if col not in df.columns:
+            if col == "id":
+                df[col] = [str(uuid.uuid4()) for _ in range(len(df))]
+            elif col == "qty":
+                df[col] = 0
+            else:
+                df[col] = ""
+    return df[required]
+
 # ----------------------------- Pages ---------------------------------------- #
 def inventory_page():
     page_header("Inventory", "Add items first. Categories come from the items themselves.")
-    df = load_data()
+    df = ensure_schema(load_data())
 
     st.subheader("Quick Add Item")
     with st.form("add_item_form", clear_on_submit=True):
@@ -233,7 +238,7 @@ def inventory_page():
     c1, c2, c3, c4 = st.columns([1.2, 1, 1.1, 2])
     with c1:
         if st.button("Save changes", type="primary", use_container_width=True):
-            save_data(edited, log_action="Save Inventory", log_details="Manual edit")
+            save_data(ensure_schema(edited), log_action="Save Inventory", log_details="Manual edit")
             st.success("Inventory saved.")
     with c2:
         if st.button("Reload", use_container_width=True):
@@ -243,7 +248,7 @@ def inventory_page():
             if st.session_state.df_history:
                 last_json = st.session_state.df_history.pop()
                 df_prev = pd.DataFrame(json.loads(last_json))
-                save_data(df_prev, log_action="Undo", log_details="Reverted to previous state")
+                save_data(ensure_schema(df_prev), log_action="Undo", log_details="Reverted to previous state")
                 st.success("Reverted to previous state.")
             else:
                 st.info("Nothing to undo yet.")
@@ -254,9 +259,10 @@ def inventory_page():
 
 def maintenance_page():
     page_header("Maintenance", "Maintenance usage • Category Manager / cleanup tools")
+
     st.info("Add items first in the **Inventory** page. This tool cleans category names and merges duplicates.")
 
-    df = load_data()
+    df = ensure_schema(load_data())
     cats = get_categories(df)
 
     st.divider()
@@ -324,7 +330,7 @@ _This never deletes items. Categories are always derived from the items themselv
 
     st.divider()
     st.subheader("Category Snapshot")
-    df_latest = load_data()
+    df_latest = ensure_schema(load_data())
     cats_now = get_categories(df_latest)
     st.caption("Current categories (after maintenance):")
     st.write(", ".join(cats_now) if cats_now else "—")
@@ -353,7 +359,8 @@ with st.sidebar:
     )
     st.divider()
 
-    df_export = load_data()
+    # Export always visible
+    df_export = ensure_schema(load_data())
     st.download_button(
         "Download inventory_data.json",
         data=df_export.to_json(orient="records", force_ascii=False, indent=2),
@@ -368,8 +375,8 @@ with st.sidebar:
             if st.session_state.df_history:
                 last_json = st.session_state.df_history.pop()
                 df_prev = pd.DataFrame(json.loads(last_json))
-                save_data(df_prev, log_action="Undo", log_details="Reverted to previous state")
-                st.success("Reverted.")
+                save_data(ensure_schema(df_prev), log_action="Undo", log_details="Reverted to previous state")
+                st.success("Reverted to previous state.")
             else:
                 st.info("Nothing to undo yet.")
     with c2:
