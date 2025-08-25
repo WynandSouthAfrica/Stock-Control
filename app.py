@@ -1,5 +1,6 @@
 # app.py — OMEC Stock Take (Streamlit)
-# Update: 1) PDF header shows ONLY the logo (no brand text), 2) "Date Issued" line on reports.
+# Update: PDF header shows ONLY the logo (no brand text, no revision text shown),
+# and "Date Issued" remains on Inventory/Transactions reports.
 
 import os, json, re, io, zipfile, glob, math, shutil
 import datetime as dt
@@ -90,7 +91,7 @@ def normalize_category(cat):
 logo_path = get_setting("logo_path", CONFIG.get("logo_path", ""))
 brand_name = get_setting("brand_name", CONFIG.get("brand_name", "OMEC"))
 brand_color = get_setting("brand_color", CONFIG.get("brand_color", "#0ea5e9"))
-revision_tag = get_setting("revision_tag", CONFIG.get("revision_tag", "Rev0.1"))
+revision_tag = get_setting("revision_tag", CONFIG.get("revision_tag", "Rev0.1"))  # kept for compatibility, not shown on PDFs
 prepared_by = get_setting("prepared_by", "")
 checked_by  = get_setting("checked_by", "")
 approved_by = get_setting("approved_by", "")
@@ -199,20 +200,12 @@ if FPDF_AVAILABLE:
             self.set_fill_color(*lighten(self.brand_rgb, 0.75))
             self.rect(x=0, y=0, w=self.w, h=14, style="F")
 
-            # Left logo only (no brand text)
-            x = 10
+            # Left logo only (no brand text, no revision)
             if self.logo_path and os.path.exists(self.logo_path):
                 try:
-                    self.image(self.logo_path, x=x, y=3, h=8)
-                    x += 26
+                    self.image(self.logo_path, x=10, y=3, h=8)
                 except Exception:
                     pass
-
-            # Right: revision
-            self.set_xy(-80, 4)
-            self.set_font("Helvetica", "", 9)
-            self.set_text_color(25, 25, 25)
-            self.cell(70, 6, txt=to_latin1(f"Revision: {self.revision_tag}"), ln=0, align="R")
 
             # Separator line
             self.set_draw_color(*self.brand_rgb)
@@ -289,7 +282,6 @@ def _calc_row_height_exact(pdf, values, widths, row_h, wrap_idx_set):
     return max(heights) if heights else row_h
 
 def _truncate_to_fit(pdf, txt: str, w: float, margin: float = 2.0) -> str:
-    """Truncate text with ellipsis so it fits inside width w (Latin-1 safe)."""
     if txt is None:
         return ""
     s = to_latin1(str(txt))
@@ -409,7 +401,7 @@ def _inventory_pdf_bytes_grouped(
     pdf.cell(0, 10, to_latin1("Inventory Report"), ln=1)
     pdf.set_font("Helvetica", "", 10)
 
-    # Date Issued shown under title
+    # Date Issued
     issued_ts = dt.datetime.now().strftime("%Y-%m-%d %H:%M")
     pdf.cell(0, 6, to_latin1(f"Date Issued: {issued_ts}"), ln=1)
 
@@ -493,7 +485,7 @@ def _inventory_pdf_bytes_grouped(
             else:
                 sub_vals.append("")
         _ensure_page_space(pdf, 7, display_cols, widths, 9, brand_rgb)
-        _draw_row(pdf, sub_vals, widths, 7, align_map=align_map, fill_rgb=light_brand, bold=True, wrap_idx_set=set())
+        _draw_row(pdf, sub_vals, widths, 7, align_map=align_map, fill_rgb=lighten(brand_rgb, 0.92), bold=True, wrap_idx_set=set())
 
     total_vals = []
     for c in present:
@@ -873,7 +865,7 @@ def view_inventory():
                 "quantity": st.column_config.NumberColumn(format="%.3f"),
                 "min_qty": st.column_config.NumberColumn(format="%.3f"),
                 "unit_cost": st.column_config.NumberColumn(format="%.2f"),
-                "convert_factor": st.column_config.NumberColumn(format="%.3f"),
+                "convert_factor": st.column_config.number_column.NumberColumn if hasattr(st.column_config, "number_column") else st.column_config.NumberColumn,  # compatibility
             }
         )
         if st.button("Save Edits (Upsert visible rows)"):
@@ -1074,8 +1066,8 @@ def view_issue_sheets():
 
     st.divider()
     st.subheader("Quick Issue (log immediately)")
-    filt_df = df[df["category"].isin(cat_select)] if cat_select else df
-    sku_list = sorted(filt_df["sku"].unique().tolist())
+    items_df = df[df["category"].isin(cat_select)] if cat_select else df
+    sku_list = sorted(items_df["sku"].unique().tolist())
 
     with st.form("quick_issue_form"):
         cols = st.columns(4)
@@ -1322,7 +1314,6 @@ def view_reports():
             pdf.set_font("Helvetica", "B", 16)
             pdf.cell(0, 10, to_latin1(title), ln=1)
             pdf.set_font("Helvetica", "", 10)
-            # Date Issued for this report as well
             pdf.cell(0, 6, to_latin1(f"Date Issued: {dt.datetime.now().strftime('%Y-%m-%d %H:%M')}"), ln=1)
             for line in meta_lines:
                 pdf.cell(0, 6, to_latin1(str(line)), ln=1)
