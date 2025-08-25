@@ -1,8 +1,9 @@
 # app.py — OMEC Stock Take (Streamlit)
-# Adds Return Sheet section to Issue Sheets PDF, fixes wrapping so text doesn't spill into blank lines,
-# and makes Return Sheet use the SAME number of blank lines per item as the Issue Sheet.
+# Feature add: Simple branding control to set a logo for all PDFs.
+# Upload a PNG/JPG (saved to ./assets/brand_logo.*) or type a server path.
+# The logo renders top-left on every PDF page header. Rest of app unchanged.
 
-import os, json, re, io, zipfile, glob, math
+import os, json, re, io, zipfile, glob, math, shutil
 import datetime as dt
 import urllib.parse
 import streamlit as st
@@ -30,6 +31,9 @@ st.set_page_config(page_title="OMEC Stock Take", page_icon="🗃️", layout="wi
 
 # ---------- Config ----------
 ROOT = os.path.dirname(__file__)
+ASSETS_DIR = os.path.join(ROOT, "assets")
+os.makedirs(ASSETS_DIR, exist_ok=True)
+
 SNAP_DIR = os.path.join(ROOT, "snapshots")
 os.makedirs(SNAP_DIR, exist_ok=True)
 
@@ -96,6 +100,19 @@ email_recipients = get_setting("email_recipients", "")
 auto_backup_enabled = str(get_setting("auto_backup_enabled", "true")).lower() in {"1","true","yes","on"}
 brand_rgb = hex_to_rgb(brand_color)
 
+# If no logo saved yet, auto-adopt a known on-disk PG Bison logo if available (one-time).
+if not logo_path:
+    try:
+        pg_bison_src = "/mnt/data/PG Bison.jpg"
+        if os.path.exists(pg_bison_src):
+            dst = os.path.join(ASSETS_DIR, "brand_logo.jpg")
+            if not os.path.exists(dst):
+                shutil.copyfile(pg_bison_src, dst)
+            upsert_setting("logo_path", dst)
+            logo_path = dst
+    except Exception:
+        pass
+
 
 # ---------- Sidebar ----------
 st.sidebar.markdown(
@@ -118,6 +135,38 @@ menu = st.sidebar.radio(
     index=0,
 )
 
+# Branding control (logo only)
+with st.sidebar.expander("Branding (Logo)", expanded=False):
+    st.caption("Upload a PNG/JPG or type a server path, then **Save Logo**.")
+    up = st.file_uploader("Upload logo", type=["png", "jpg", "jpeg"])
+    col_a, col_b = st.columns([3, 1])
+    logo_input = col_a.text_input("Or path on server", value=logo_path or "")
+    if col_b.button("Save Logo"):
+        try:
+            new_path = logo_input.strip()
+            if up is not None:
+                ext = os.path.splitext(up.name)[1].lower() or ".png"
+                if ext not in [".png", ".jpg", ".jpeg"]:
+                    ext = ".png"
+                new_path = os.path.join(ASSETS_DIR, f"brand_logo{ext}")
+                with open(new_path, "wb") as f:
+                    f.write(up.read())
+            if new_path:
+                upsert_setting("logo_path", new_path)
+                st.success("Logo saved. Reloading…")
+                st.rerun()
+        except Exception as e:
+            st.error(f"Save failed: {e}")
+    clear_logo = st.button("Clear Logo")
+    if clear_logo:
+        upsert_setting("logo_path", "")
+        st.success("Logo cleared. Reloading…")
+        st.rerun()
+    if logo_path:
+        try:
+            st.image(_norm_path(logo_path), caption="Current logo", use_container_width=True)
+        except Exception:
+            st.caption("Logo path set, but preview failed.")
 
 # ---------- Auto-backup (daily) ----------
 def _has_snapshot_for_today():
@@ -244,15 +293,14 @@ def _truncate_to_fit(pdf, txt: str, w: float, margin: float = 2.0) -> str:
     maxw = max(1.0, w - margin)
     if pdf.get_string_width(s) <= maxw:
         return s
-    ell = "..."  # ASCII-safe
+    ell = "..."
     if pdf.get_string_width(ell) > maxw:
-        return ""  # column too narrow even for dots
+        return ""
     while s and pdf.get_string_width(s + ell) > maxw:
         s = s[:-1]
     return (s + ell) if s else ell
 
 def _draw_row(pdf, values, widths, row_h, align_map=None, fill_rgb=None, bold=False, text_rgb=(15,15,15), wrap_idx_set=None, border="1"):
-    """Draw a row. Cells listed in wrap_idx_set can wrap (multi_cell). Others are single-line cells clipped with ellipsis."""
     if align_map is None:
         align_map = {}
     if wrap_idx_set is None:
@@ -273,11 +321,9 @@ def _draw_row(pdf, values, widths, row_h, align_map=None, fill_rgb=None, bold=Fa
         txt = "" if v is None else str(v)
 
         if idx in wrap_idx_set:
-            # Allow wrapping for this column
             pdf.multi_cell(w, row_h, to_latin1(txt), border=border, align=align, new_x="RIGHT", new_y="TOP", fill=bool(fill_rgb))
             pdf.set_xy(x + w, y_start)
         else:
-            # Single line cell with truncation
             t = _truncate_to_fit(pdf, txt, w)
             pdf.cell(w, max_h, t, align=align, border=border)
     pdf.set_xy(x_left, y_start + max_h)
@@ -486,12 +532,6 @@ def _issue_sheet_pdf_bytes(
     include_returns: bool = False,
     return_blanks_cap: int = 12, fixed_return_blanks: int | None = None
 ) -> bytes:
-    """
-    Issue section: summary row per item, then ruled blank rows for write-ins.
-    Return section (optional): per item descriptor row, then ruled blank rows with return-specific columns.
-    Return section now reuses EXACTLY the same number of blank lines per item as Issue section.
-    Also, non-wrapping cells are drawn as single-line cells (with ellipsis) so text never spills into blank rows.
-    """
     df = df.copy()
     if "category" in df.columns:
         df["category"] = df["category"].apply(normalize_category)
@@ -556,7 +596,6 @@ def _issue_sheet_pdf_bytes(
     page_w = pdf.w - pdf.l_margin - pdf.r_margin
     widths = _compute_col_widths(pdf, display_cols, rows_for_width, page_w, font_size=9)
 
-    # widen important handwriting columns; also widen Item to reduce chance of ellipsis
     for i, name in enumerate(display_cols):
         if name in {"Item"}:                 widths[i] = max(widths[i], 55)
         if name in {"Qty Issued"}:           widths[i] = max(widths[i], 20)
@@ -575,10 +614,8 @@ def _issue_sheet_pdf_bytes(
         groups = ["(All)"]
         df["category"] = "(All)"
 
-    # capture per-item blank counts to reuse for Return sheet
-    per_item_blanks = []  # list of dicts: {cat, sku, name, unit, blanks}
+    per_item_blanks = []
 
-    # ---- Issue rows
     for cat in groups:
         block = df[df["category"].fillna("(Unspecified)") == cat]
         if block.empty:
@@ -604,7 +641,6 @@ def _issue_sheet_pdf_bytes(
                 "", "", "", ""
             ]
             _ensure_page_space(pdf, 8, display_cols, widths, 9, brand_rgb)
-            # wrap_idx_set is empty: draw single-line cells (with truncation)
             _draw_row(pdf, values, widths, 7, align_map=align_map, border="1", wrap_idx_set=set())
 
             if fixed_blanks is not None and fixed_blanks > 0:
@@ -624,7 +660,6 @@ def _issue_sheet_pdf_bytes(
                 _ensure_page_space(pdf, 7, display_cols, widths, 9, brand_rgb)
                 draw_ruled_blank_row(pdf, widths, row_h=7, line_rgb=(170,170,170))
 
-    # ---- Return section (optional) — uses SAME blank counts per item
     if include_returns:
         pdf.add_page()
         pdf.set_font("Helvetica", "B", 15)
@@ -652,7 +687,6 @@ def _issue_sheet_pdf_bytes(
 
         _draw_header_row(pdf, ret_cols, ret_widths, 9, brand_rgb)
 
-        # iterate by categories for nice grouping
         for cat in groups:
             items_cat = [x for x in per_item_blanks if x["cat"] == cat]
             if not items_cat:
@@ -666,7 +700,6 @@ def _issue_sheet_pdf_bytes(
 
             pdf.set_font("Helvetica", "", 9)
             for it in items_cat:
-                # descriptor row (show SKU/Item/Unit; others blank)
                 desc_vals = [it["sku"], it["name"], it["unit"], "", "", "", "", ""]
                 _ensure_page_space(pdf, 8, ret_cols, ret_widths, 9, brand_rgb)
                 _draw_row(pdf, desc_vals, ret_widths, 7, border="1", wrap_idx_set=set())
@@ -676,7 +709,6 @@ def _issue_sheet_pdf_bytes(
                     _ensure_page_space(pdf, 7, ret_cols, ret_widths, 9, brand_rgb)
                     draw_ruled_blank_row(pdf, ret_widths, row_h=7, line_rgb=(170,170,170))
 
-        # footer lines
         pdf.ln(6)
         pdf.set_font("Helvetica", "", 9)
         w = (pdf.w - pdf.l_margin - pdf.r_margin)
