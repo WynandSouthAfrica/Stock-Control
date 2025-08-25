@@ -1,6 +1,5 @@
 # app.py — OMEC Stock Take (Streamlit)
-# Update: Add configurable snapshot folder (Sidebar ▸ Snapshot folder).
-# Snapshots default to <app>/snapshots but can be redirected anywhere; new ZIPs are moved there.
+# Update: Issue & Return sheets in A4 Landscape + force-fit table widths to page width.
 
 import os, json, re, io, zipfile, glob, math, shutil
 import datetime as dt
@@ -16,7 +15,6 @@ from db import (
 )
 from utils import export_snapshot, timestamp
 
-
 # ---------- PDF engine ----------
 try:
     from fpdf import FPDF
@@ -24,36 +22,39 @@ try:
 except Exception:
     FPDF_AVAILABLE = False
 
-
 st.set_page_config(page_title="OMEC Stock Take", page_icon="🗃️", layout="wide")
 
-
-# ---------- Config ----------
+# ---------- Paths / helpers ----------
 ROOT = os.path.dirname(__file__)
 ASSETS_DIR = os.path.join(ROOT, "assets")
 os.makedirs(ASSETS_DIR, exist_ok=True)
 
-DEFAULT_SNAP_DIR = os.path.join(ROOT, "snapshots")
-SNAP_DIR = get_setting("snap_dir", DEFAULT_SNAP_DIR) or DEFAULT_SNAP_DIR
-SNAP_DIR = os.path.normpath(SNAP_DIR if os.path.isabs(SNAP_DIR) else os.path.join(ROOT, SNAP_DIR))
-os.makedirs(SNAP_DIR, exist_ok=True)
-
-CONFIG_PATH = os.path.join(ROOT, "config.json")
-if os.path.exists(CONFIG_PATH):
-    with open(CONFIG_PATH, "r") as f:
-        CONFIG = json.load(f)
-else:
-    CONFIG = {"brand_name": "OMEC", "brand_color": "#0ea5e9", "logo_path": "", "revision_tag": "Rev0.1"}
-
-init_db()
-
-
-# ---------- Helpers ----------
-def _norm_path(p: str) -> str:
-    if not isinstance(p, str) or not p.strip():
+def _coerce_path(user_path: str) -> str:
+    """
+    Make a user-supplied path usable on this OS.
+    - On Windows: return absolute Windows path.
+    - On POSIX: if it *looks* like a Windows path (e.g. C:\...), translate to /mnt/c/... (WSL/Docker-on-WSL).
+    - Otherwise: absolute → as-is; relative → relative to app root.
+    """
+    if not isinstance(user_path, str) or not user_path.strip():
         return ""
-    p = os.path.normpath(p)
-    return p if os.path.isabs(p) else os.path.join(ROOT, p)
+    p = user_path.strip()
+
+    m = re.match(r"^([A-Za-z]):[\\/](.*)$", p)
+    if m and os.name != "nt":
+        drive = m.group(1).lower()
+        rest = m.group(2).replace("\\", "/")
+        return os.path.normpath(f"/mnt/{drive}/{rest}")
+
+    if p.startswith("\\\\") and os.name != "nt":
+        return p
+
+    if os.path.isabs(p):
+        return os.path.normpath(p)
+    return os.path.normpath(os.path.join(ROOT, p))
+
+def _norm_path(p: str) -> str:
+    return _coerce_path(p)
 
 def safe_show_logo(path: str):
     try:
@@ -88,15 +89,24 @@ def normalize_category(cat):
     s = re.sub(r"\s+", " ", s)
     return s.title()
 
-def _move_to_snap_dir(src_path: str) -> str:
-    """Ensure the snapshot ZIP ends up in SNAP_DIR; move it if needed and return final path."""
+def _can_write_here(path_dir: str) -> tuple[bool, str]:
+    try:
+        os.makedirs(path_dir, exist_ok=True)
+        testfile = os.path.join(path_dir, ".write_test.tmp")
+        with open(testfile, "w", encoding="utf-8") as f:
+            f.write("ok")
+        os.remove(testfile)
+        return True, os.path.abspath(path_dir)
+    except Exception:
+        return False, os.path.abspath(path_dir)
+
+def _move_to_snap_dir(src_path: str, snap_dir: str) -> str:
     try:
         if not src_path:
             return src_path
-        os.makedirs(SNAP_DIR, exist_ok=True)
-        dst_path = os.path.join(SNAP_DIR, os.path.basename(src_path))
+        os.makedirs(snap_dir, exist_ok=True)
+        dst_path = os.path.join(snap_dir, os.path.basename(src_path))
         if os.path.abspath(src_path) != os.path.abspath(dst_path):
-            # Move (or copy as fallback)
             try:
                 shutil.move(src_path, dst_path)
             except Exception:
@@ -105,12 +115,26 @@ def _move_to_snap_dir(src_path: str) -> str:
     except Exception:
         return src_path
 
+# ---------- Init DB / Config ----------
+init_db()
+
+CONFIG_PATH = os.path.join(ROOT, "config.json")
+if os.path.exists(CONFIG_PATH):
+    with open(CONFIG_PATH, "r") as f:
+        CONFIG = json.load(f)
+else:
+    CONFIG = {"brand_name": "OMEC", "brand_color": "#0ea5e9", "logo_path": "", "revision_tag": "Rev0.1"}
+
+DEFAULT_SNAP_DIR = os.path.join(ROOT, "snapshots")
+_saved_snap = get_setting("snap_dir", DEFAULT_SNAP_DIR) or DEFAULT_SNAP_DIR
+SNAP_DIR = _coerce_path(_saved_snap)
+os.makedirs(SNAP_DIR, exist_ok=True)
 
 # ---------- Settings ----------
 logo_path = get_setting("logo_path", CONFIG.get("logo_path", ""))
 brand_name = get_setting("brand_name", CONFIG.get("brand_name", "OMEC"))
 brand_color = get_setting("brand_color", CONFIG.get("brand_color", "#0ea5e9"))
-revision_tag = get_setting("revision_tag", CONFIG.get("revision_tag", "Rev0.1"))  # kept for compatibility
+revision_tag = get_setting("revision_tag", CONFIG.get("revision_tag", "Rev0.1"))
 prepared_by = get_setting("prepared_by", "")
 checked_by  = get_setting("checked_by", "")
 approved_by = get_setting("approved_by", "")
@@ -118,7 +142,7 @@ email_recipients = get_setting("email_recipients", "")
 auto_backup_enabled = str(get_setting("auto_backup_enabled", "true")).lower() in {"1","true","yes","on"}
 brand_rgb = hex_to_rgb(brand_color)
 
-# Try pick up PG Bison logo automatically if not set
+# Try auto-detect bundled PG Bison logo on first run
 if not logo_path:
     try:
         pg_bison_src = "/mnt/data/PG Bison.jpg"
@@ -130,7 +154,6 @@ if not logo_path:
             logo_path = dst
     except Exception:
         pass
-
 
 # ---------- Sidebar ----------
 st.sidebar.markdown(
@@ -174,8 +197,7 @@ with st.sidebar.expander("Branding (Logo)", expanded=False):
                 st.rerun()
         except Exception as e:
             st.error(f"Save failed: {e}")
-    clear_logo = st.button("Clear Logo")
-    if clear_logo:
+    if st.button("Clear Logo"):
         upsert_setting("logo_path", "")
         st.success("Logo cleared. Reloading…")
         st.rerun()
@@ -187,18 +209,21 @@ with st.sidebar.expander("Branding (Logo)", expanded=False):
 
 with st.sidebar.expander("Snapshot folder", expanded=False):
     st.caption("Current location for ZIPs (auto-backups and manual snapshots).")
-    st.code(os.path.abspath(SNAP_DIR))
-    new_snap = st.text_input("Set snapshot folder", value=SNAP_DIR)
+    ok, resolved = _can_write_here(SNAP_DIR)
+    st.code(resolved + ("  ✔" if ok else "  ✖"))
+    new_snap_raw = st.text_input("Set snapshot folder", value=get_setting("snap_dir", SNAP_DIR))
     if st.button("Save folder"):
         try:
-            new_snap_abs = _norm_path(new_snap.strip())
-            os.makedirs(new_snap_abs, exist_ok=True)
-            upsert_setting("snap_dir", new_snap_abs)
-            st.success("Snapshot folder updated. Reloading…")
-            st.rerun()
+            new_abs = _coerce_path(new_snap_raw)
+            ok2, resolved2 = _can_write_here(new_abs)
+            if not ok2:
+                st.error(f"That folder isn't accessible from this server: {resolved2}")
+            else:
+                upsert_setting("snap_dir", resolved2)
+                st.success("Snapshot folder updated. Reloading…")
+                st.rerun()
         except Exception as e:
             st.error(f"Could not set folder: {e}")
-
 
 # ---------- Auto-backup (daily) ----------
 def _has_snapshot_for_today():
@@ -210,12 +235,11 @@ if auto_backup_enabled and not _has_snapshot_for_today():
         items = get_items()
         tx = get_transactions(limit=1_000_000)
         path = export_snapshot(items, tx, tag=f"Auto_{dt.date.today().isoformat()}", note="Auto-backup on app open")
-        path = _move_to_snap_dir(path)
+        path = _move_to_snap_dir(path, SNAP_DIR)
         save_version_record(f"Auto_{dt.date.today().isoformat()}", "Auto-backup", path)
         st.sidebar.success("Auto-backup snapshot created for today.")
     except Exception:
         st.sidebar.warning("Auto-backup attempt failed (non-blocking).")
-
 
 # ---------- PDF base ----------
 if FPDF_AVAILABLE:
@@ -251,7 +275,6 @@ if FPDF_AVAILABLE:
             self.set_text_color(80, 80, 80)
             self.cell(0, 6, to_latin1(f"Page {self.page_no()}"), align="R")
 
-
 def _compute_col_widths(pdf, columns, rows, page_w, font_size):
     pdf.set_font("Helvetica", "B", font_size)
     widths = []
@@ -273,6 +296,17 @@ def _compute_col_widths(pdf, columns, rows, page_w, font_size):
         if extra > 0 and len(widths) > 0:
             bump = extra / len(widths)
             widths = [w + bump for w in widths]
+    return widths
+
+def _fit_widths(widths, page_w):
+    """After manual tweaks, re-fit widths to page width (no overflow)."""
+    total = sum(widths)
+    if total > page_w and total > 0:
+        scale = page_w / total
+        widths = [w * scale for w in widths]
+    elif total < page_w and len(widths) > 0:
+        bump = (page_w - total) / len(widths)
+        widths = [w + bump for w in widths]
     return widths
 
 def _draw_header_row(pdf, columns, widths, font_size, brand_rgb):
@@ -351,8 +385,7 @@ def _draw_row(pdf, values, widths, row_h, align_map=None, fill_rgb=None, bold=Fa
             pdf.cell(w, max_h, t, align=align, border=border)
     pdf.set_xy(x_left, y_start + max_h)
 
-
-# ---------- Inventory PDF (grouped) ----------
+# ---------- Inventory PDF (grouped; unchanged) ----------
 def _inventory_pdf_bytes_grouped(
     df: pd.DataFrame,
     brand_name, brand_rgb, logo_path, revision_tag,
@@ -428,7 +461,6 @@ def _inventory_pdf_bytes_grouped(
     pdf.set_font("Helvetica", "B", 16)
     pdf.cell(0, 10, to_latin1("Inventory Report"), ln=1)
     pdf.set_font("Helvetica", "", 10)
-
     issued_ts = dt.datetime.now().strftime("%Y-%m-%d %H:%M")
     pdf.cell(0, 6, to_latin1(f"Date Issued: {issued_ts}"), ln=1)
 
@@ -547,8 +579,7 @@ def _inventory_pdf_bytes_grouped(
     data = pdf.output(dest="S")
     return bytes(data) if isinstance(data, (bytes, bytearray)) else str(data).encode("latin-1", errors="ignore")
 
-
-# ---------- Issue Sheet PDF (A4) + Return Sheet ----------
+# ---------- Issue Sheet PDF (A4 Landscape) + Return Sheet ----------
 def _issue_sheet_pdf_bytes(
     df: pd.DataFrame,
     brand_name, brand_rgb, logo_path, revision_tag,
@@ -587,9 +618,10 @@ def _issue_sheet_pdf_bytes(
             "Date": "",
         })
 
+    # A4 LANDSCAPE
     pdf = BrandedPDF(
         brand_name=brand_name, brand_rgb=brand_rgb, logo_path=logo_path, revision_tag=revision_tag,
-        orientation="P", unit="mm", format="A4"
+        orientation="L", unit="mm", format="A4"
     )
     pdf.add_page()
     pdf.set_text_color(30, 30, 30)
@@ -622,12 +654,14 @@ def _issue_sheet_pdf_bytes(
     page_w = pdf.w - pdf.l_margin - pdf.r_margin
     widths = _compute_col_widths(pdf, display_cols, rows_for_width, page_w, font_size=9)
 
+    # widen key columns a bit for handwriting, then re-fit to page
     for i, name in enumerate(display_cols):
-        if name in {"Item"}:                 widths[i] = max(widths[i], 55)
-        if name in {"Qty Issued"}:           widths[i] = max(widths[i], 20)
-        if name in {"To (Person)"}:          widths[i] = max(widths[i], 35)
-        if name in {"Signature"}:            widths[i] = max(widths[i], 32)
-        if name in {"Date"}:                 widths[i] = max(widths[i], 22)
+        if name in {"Item"}:                 widths[i] = max(widths[i], 80)
+        if name in {"Qty Issued"}:           widths[i] = max(widths[i], 26)
+        if name in {"To (Person)"}:          widths[i] = max(widths[i], 45)
+        if name in {"Signature"}:            widths[i] = max(widths[i], 38)
+        if name in {"Date"}:                 widths[i] = max(widths[i], 26)
+    widths = _fit_widths(widths, page_w)
 
     _draw_header_row(pdf, display_cols, widths, 9, brand_rgb)
     align_map = {display_cols.index("On-hand"): "R", display_cols.index("Min"): "R"}
@@ -642,6 +676,7 @@ def _issue_sheet_pdf_bytes(
 
     per_item_blanks = []
 
+    # ---- Issue rows
     for cat in groups:
         block = df[df["category"].fillna("(Unspecified)") == cat]
         if block.empty:
@@ -686,8 +721,9 @@ def _issue_sheet_pdf_bytes(
                 _ensure_page_space(pdf, 7, display_cols, widths, 9, brand_rgb)
                 draw_ruled_blank_row(pdf, widths, row_h=7, line_rgb=(170,170,170))
 
+    # ---- Return section (optional) — A4 LANDSCAPE + fit widths
     if include_returns:
-        pdf.add_page()
+        pdf.add_page(orientation="L")
         pdf.set_font("Helvetica", "B", 15)
         pdf.cell(0, 9, to_latin1("Stock Return Sheet"), ln=1)
         pdf.set_font("Helvetica", "", 10)
@@ -701,15 +737,17 @@ def _issue_sheet_pdf_bytes(
 
         ret_cols = ["SKU","Item","Unit","Qty Returned","From (Person)","Signature","Date","Condition / Notes"]
         ret_rows_for_width = [{"SKU":"","Item":"","Unit":"","Qty Returned":"","From (Person)":"","Signature":"","Date":"","Condition / Notes":""}]
+        page_w = pdf.w - pdf.l_margin - pdf.r_margin
         ret_widths = _compute_col_widths(pdf, ret_cols, ret_rows_for_width, page_w, font_size=9)
 
         for i, name in enumerate(ret_cols):
-            if name in {"Item"}:                   ret_widths[i] = max(ret_widths[i], 55)
-            if name in {"Qty Returned"}:           ret_widths[i] = max(ret_widths[i], 24)
-            if name in {"From (Person)"}:          ret_widths[i] = max(ret_widths[i], 38)
-            if name in {"Signature"}:              ret_widths[i] = max(ret_widths[i], 32)
-            if name in {"Date"}:                   ret_widths[i] = max(ret_widths[i], 22)
-            if name in {"Condition / Notes"}:      ret_widths[i] = max(ret_widths[i], 48)
+            if name in {"Item"}:                   ret_widths[i] = max(ret_widths[i], 90)
+            if name in {"Qty Returned"}:           ret_widths[i] = max(ret_widths[i], 30)
+            if name in {"From (Person)"}:          ret_widths[i] = max(ret_widths[i], 50)
+            if name in {"Signature"}:              ret_widths[i] = max(ret_widths[i], 40)
+            if name in {"Date"}:                   ret_widths[i] = max(ret_widths[i], 26)
+            if name in {"Condition / Notes"}:      ret_widths[i] = max(ret_widths[i], 70)
+        ret_widths = _fit_widths(ret_widths, page_w)
 
         _draw_header_row(pdf, ret_cols, ret_widths, 9, brand_rgb)
 
@@ -751,7 +789,6 @@ def _issue_sheet_pdf_bytes(
 
     data = pdf.output(dest="S")
     return bytes(data) if isinstance(data, (bytes, bytearray)) else str(data).encode("latin-1", errors="ignore")
-
 
 # ---------- Views ----------
 def view_dashboard():
@@ -815,7 +852,6 @@ def view_dashboard():
             mailto = f"mailto:{email_recipients}?subject={encoded_subject}&body={encoded_body}"
             st.text_area("Email body (copy/paste)", value=body, height=120)
             st.markdown(f"[Open email draft]({mailto})")
-
 
 def view_inventory():
     st.title("📦 Inventory")
@@ -968,7 +1004,6 @@ def view_inventory():
         else:
             st.error("Enter a SKU to delete.")
 
-
 def view_transactions():
     st.title("🔁 Transactions")
     st.caption("Record stock movement in/out and maintain an audit trail.")
@@ -1027,7 +1062,6 @@ def view_transactions():
             f["notes"].astype(str).str.lower().str.contains(s)
         ]
     st.dataframe(f, use_container_width=True)
-
 
 def view_issue_sheets():
     st.title("📝 Issue Sheets")
@@ -1113,7 +1147,6 @@ def view_issue_sheets():
                 st.success(f"Issue logged for {q_sku} → {q_to} (-{q_qty})")
                 st.rerun()
 
-
 # ---------- Versions / Snapshots ----------
 def _zip_list():
     return sorted(glob.glob(os.path.join(SNAP_DIR, "*.zip")), reverse=True)
@@ -1139,7 +1172,7 @@ def view_versions():
         items = get_items()
         tx = get_transactions(limit=1_000_000)
         zip_path = export_snapshot(items, tx, tag=tag, note=note)
-        zip_path = _move_to_snap_dir(zip_path)
+        zip_path = _move_to_snap_dir(zip_path, SNAP_DIR)
         save_version_record(tag or "", note or "", zip_path)
         st.success(f"Snapshot created: {zip_path}")
         with open(zip_path, "rb") as f:
@@ -1154,7 +1187,7 @@ def view_versions():
         tx = get_transactions(limit=1_000_000)
         site_tag = f"{site.replace(' ', '_')}_{timestamp()}"
         zip_path = export_snapshot(items, tx, tag=site_tag, note=f"Site: {site}")
-        zip_path = _move_to_snap_dir(zip_path)
+        zip_path = _move_to_snap_dir(zip_path, SNAP_DIR)
         save_version_record(site_tag, f"Site {site}", zip_path)
         st.success(f"Snapshot for '{site}' saved: {os.path.basename(zip_path)}")
     if cols[2].button("Restore latest for site"):
@@ -1193,7 +1226,6 @@ def view_versions():
         st.info("No versions yet.")
     st.caption("Snapshot files in current folder:")
     st.write([os.path.basename(p) for p in _zip_list()])
-
 
 def _restore_from_bytes(zip_bytes: bytes, replace_items: bool, append_tx: bool, skip_dup: bool, preserve_ts: bool):
     zf = zipfile.ZipFile(io.BytesIO(zip_bytes))
@@ -1289,7 +1321,6 @@ def _restore_from_bytes(zip_bytes: bytes, replace_items: bool, append_tx: bool, 
                 st.warning(f"Transaction restore skipped for SKU={key[0]}: {e}")
 
     st.success(f"Restore complete. Items loaded: {added_items}" + (f" | Transactions added: {added_tx}" if append_tx and tx_name else ""))
-
 
 def view_reports():
     st.title("🧾 Reports & Export (PDF)")
@@ -1427,7 +1458,6 @@ def view_reports():
     pdf_bytes_tx = df_to_pdf_bytes_pro("Transaction Log", df_tx, meta, brand_name, brand_rgb, logo_path, revision_tag)
     st.download_button("Download Transactions PDF", data=pdf_bytes_tx, file_name=f"transactions_{timestamp()}.pdf", mime="application/pdf")
 
-
 def view_maintenance():
     st.title("🛠️ Maintenance")
     st.caption("Maintenance usage + Category Manager / cleanup tools.")
@@ -1492,7 +1522,6 @@ def view_maintenance():
                 fixed += 1
         st.success(f"Normalized {fixed} item(s).")
         st.rerun()
-
 
 # ---------- Router ----------
 if menu == "Dashboard":
