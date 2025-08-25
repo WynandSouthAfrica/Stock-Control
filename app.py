@@ -1,5 +1,6 @@
 # app.py — OMEC Stock Take (Streamlit)
-# Update: Issue & Return sheets in A4 Landscape + force-fit table widths to page width.
+# Update: Inventory list auto-sorts by Category → SKU → Name (alphabetical).
+# (All other behavior/layout unchanged. Issue/Return sheets are A4 landscape with fit-to-width.)
 
 import os, json, re, io, zipfile, glob, math, shutil
 import datetime as dt
@@ -32,9 +33,9 @@ os.makedirs(ASSETS_DIR, exist_ok=True)
 def _coerce_path(user_path: str) -> str:
     """
     Make a user-supplied path usable on this OS.
-    - On Windows: return absolute Windows path.
-    - On POSIX: if it *looks* like a Windows path (e.g. C:\...), translate to /mnt/c/... (WSL/Docker-on-WSL).
-    - Otherwise: absolute → as-is; relative → relative to app root.
+    On Windows: return absolute Windows path.
+    On POSIX: if it looks like C:\..., translate to /mnt/c/... (WSL/Docker-on-WSL).
+    Otherwise: absolute → as-is; relative → relative to app root.
     """
     if not isinstance(user_path, str) or not user_path.strip():
         return ""
@@ -299,7 +300,6 @@ def _compute_col_widths(pdf, columns, rows, page_w, font_size):
     return widths
 
 def _fit_widths(widths, page_w):
-    """After manual tweaks, re-fit widths to page width (no overflow)."""
     total = sum(widths)
     if total > page_w and total > 0:
         scale = page_w / total
@@ -385,7 +385,7 @@ def _draw_row(pdf, values, widths, row_h, align_map=None, fill_rgb=None, bold=Fa
             pdf.cell(w, max_h, t, align=align, border=border)
     pdf.set_xy(x_left, y_start + max_h)
 
-# ---------- Inventory PDF (grouped; unchanged) ----------
+# ---------- Inventory PDF (grouped) ----------
 def _inventory_pdf_bytes_grouped(
     df: pd.DataFrame,
     brand_name, brand_rgb, logo_path, revision_tag,
@@ -873,6 +873,15 @@ def view_inventory():
             fdf["location"].astype(str).str.lower().str.contains(f)
         )
         fdf = fdf[mask]
+
+    # >>> Auto-sort by Category → SKU → Name
+    sort_keys = []
+    if "category" in fdf.columns: sort_keys.append("category")
+    if "sku" in fdf.columns:      sort_keys.append("sku")
+    if "name" in fdf.columns:     sort_keys.append("name")
+    if sort_keys:
+        fdf = fdf.sort_values(by=sort_keys, kind="stable", na_position="last").reset_index(drop=True)
+    # <<<
 
     with st.form("add_item"):
         cols = st.columns(4)
