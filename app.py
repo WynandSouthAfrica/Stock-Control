@@ -1,6 +1,6 @@
 # app.py — OMEC Stock Take (Streamlit)
-# Update: PDF header shows ONLY the logo (no brand text, no revision text shown),
-# and "Date Issued" remains on Inventory/Transactions reports.
+# Update: Add configurable snapshot folder (Sidebar ▸ Snapshot folder).
+# Snapshots default to <app>/snapshots but can be redirected anywhere; new ZIPs are moved there.
 
 import os, json, re, io, zipfile, glob, math, shutil
 import datetime as dt
@@ -33,7 +33,9 @@ ROOT = os.path.dirname(__file__)
 ASSETS_DIR = os.path.join(ROOT, "assets")
 os.makedirs(ASSETS_DIR, exist_ok=True)
 
-SNAP_DIR = os.path.join(ROOT, "snapshots")
+DEFAULT_SNAP_DIR = os.path.join(ROOT, "snapshots")
+SNAP_DIR = get_setting("snap_dir", DEFAULT_SNAP_DIR) or DEFAULT_SNAP_DIR
+SNAP_DIR = os.path.normpath(SNAP_DIR if os.path.isabs(SNAP_DIR) else os.path.join(ROOT, SNAP_DIR))
 os.makedirs(SNAP_DIR, exist_ok=True)
 
 CONFIG_PATH = os.path.join(ROOT, "config.json")
@@ -86,12 +88,29 @@ def normalize_category(cat):
     s = re.sub(r"\s+", " ", s)
     return s.title()
 
+def _move_to_snap_dir(src_path: str) -> str:
+    """Ensure the snapshot ZIP ends up in SNAP_DIR; move it if needed and return final path."""
+    try:
+        if not src_path:
+            return src_path
+        os.makedirs(SNAP_DIR, exist_ok=True)
+        dst_path = os.path.join(SNAP_DIR, os.path.basename(src_path))
+        if os.path.abspath(src_path) != os.path.abspath(dst_path):
+            # Move (or copy as fallback)
+            try:
+                shutil.move(src_path, dst_path)
+            except Exception:
+                shutil.copyfile(src_path, dst_path)
+        return dst_path
+    except Exception:
+        return src_path
+
 
 # ---------- Settings ----------
 logo_path = get_setting("logo_path", CONFIG.get("logo_path", ""))
 brand_name = get_setting("brand_name", CONFIG.get("brand_name", "OMEC"))
 brand_color = get_setting("brand_color", CONFIG.get("brand_color", "#0ea5e9"))
-revision_tag = get_setting("revision_tag", CONFIG.get("revision_tag", "Rev0.1"))  # kept for compatibility, not shown on PDFs
+revision_tag = get_setting("revision_tag", CONFIG.get("revision_tag", "Rev0.1"))  # kept for compatibility
 prepared_by = get_setting("prepared_by", "")
 checked_by  = get_setting("checked_by", "")
 approved_by = get_setting("approved_by", "")
@@ -99,7 +118,7 @@ email_recipients = get_setting("email_recipients", "")
 auto_backup_enabled = str(get_setting("auto_backup_enabled", "true")).lower() in {"1","true","yes","on"}
 brand_rgb = hex_to_rgb(brand_color)
 
-# One-time adopt known PG Bison logo if present
+# Try pick up PG Bison logo automatically if not set
 if not logo_path:
     try:
         pg_bison_src = "/mnt/data/PG Bison.jpg"
@@ -134,7 +153,6 @@ menu = st.sidebar.radio(
     index=0,
 )
 
-# Branding control (logo only)
 with st.sidebar.expander("Branding (Logo)", expanded=False):
     st.caption("Upload a PNG/JPG or type a server path, then **Save Logo**.")
     up = st.file_uploader("Upload logo", type=["png", "jpg", "jpeg"])
@@ -167,6 +185,20 @@ with st.sidebar.expander("Branding (Logo)", expanded=False):
         except Exception:
             st.caption("Logo path set, but preview failed.")
 
+with st.sidebar.expander("Snapshot folder", expanded=False):
+    st.caption("Current location for ZIPs (auto-backups and manual snapshots).")
+    st.code(os.path.abspath(SNAP_DIR))
+    new_snap = st.text_input("Set snapshot folder", value=SNAP_DIR)
+    if st.button("Save folder"):
+        try:
+            new_snap_abs = _norm_path(new_snap.strip())
+            os.makedirs(new_snap_abs, exist_ok=True)
+            upsert_setting("snap_dir", new_snap_abs)
+            st.success("Snapshot folder updated. Reloading…")
+            st.rerun()
+        except Exception as e:
+            st.error(f"Could not set folder: {e}")
+
 
 # ---------- Auto-backup (daily) ----------
 def _has_snapshot_for_today():
@@ -178,6 +210,7 @@ if auto_backup_enabled and not _has_snapshot_for_today():
         items = get_items()
         tx = get_transactions(limit=1_000_000)
         path = export_snapshot(items, tx, tag=f"Auto_{dt.date.today().isoformat()}", note="Auto-backup on app open")
+        path = _move_to_snap_dir(path)
         save_version_record(f"Auto_{dt.date.today().isoformat()}", "Auto-backup", path)
         st.sidebar.success("Auto-backup snapshot created for today.")
     except Exception:
@@ -196,18 +229,13 @@ if FPDF_AVAILABLE:
             self.set_auto_page_break(auto=True, margin=12)
 
         def header(self):
-            # Top band
             self.set_fill_color(*lighten(self.brand_rgb, 0.75))
             self.rect(x=0, y=0, w=self.w, h=14, style="F")
-
-            # Left logo only (no brand text, no revision)
             if self.logo_path and os.path.exists(self.logo_path):
                 try:
                     self.image(self.logo_path, x=10, y=3, h=8)
                 except Exception:
                     pass
-
-            # Separator line
             self.set_draw_color(*self.brand_rgb)
             self.set_line_width(0.4)
             self.line(8, 14, self.w - 8, 14)
@@ -401,7 +429,6 @@ def _inventory_pdf_bytes_grouped(
     pdf.cell(0, 10, to_latin1("Inventory Report"), ln=1)
     pdf.set_font("Helvetica", "", 10)
 
-    # Date Issued
     issued_ts = dt.datetime.now().strftime("%Y-%m-%d %H:%M")
     pdf.cell(0, 6, to_latin1(f"Date Issued: {issued_ts}"), ln=1)
 
@@ -865,7 +892,7 @@ def view_inventory():
                 "quantity": st.column_config.NumberColumn(format="%.3f"),
                 "min_qty": st.column_config.NumberColumn(format="%.3f"),
                 "unit_cost": st.column_config.NumberColumn(format="%.2f"),
-                "convert_factor": st.column_config.number_column.NumberColumn if hasattr(st.column_config, "number_column") else st.column_config.NumberColumn,  # compatibility
+                "convert_factor": st.column_config.NumberColumn(format="%.3f"),
             }
         )
         if st.button("Save Edits (Upsert visible rows)"):
@@ -1066,8 +1093,8 @@ def view_issue_sheets():
 
     st.divider()
     st.subheader("Quick Issue (log immediately)")
-    items_df = df[df["category"].isin(cat_select)] if cat_select else df
-    sku_list = sorted(items_df["sku"].unique().tolist())
+    filt_df = df[df["category"].isin(cat_select)] if cat_select else df
+    sku_list = sorted(filt_df["sku"].unique().tolist())
 
     with st.form("quick_issue_form"):
         cols = st.columns(4)
@@ -1112,6 +1139,7 @@ def view_versions():
         items = get_items()
         tx = get_transactions(limit=1_000_000)
         zip_path = export_snapshot(items, tx, tag=tag, note=note)
+        zip_path = _move_to_snap_dir(zip_path)
         save_version_record(tag or "", note or "", zip_path)
         st.success(f"Snapshot created: {zip_path}")
         with open(zip_path, "rb") as f:
@@ -1126,6 +1154,7 @@ def view_versions():
         tx = get_transactions(limit=1_000_000)
         site_tag = f"{site.replace(' ', '_')}_{timestamp()}"
         zip_path = export_snapshot(items, tx, tag=site_tag, note=f"Site: {site}")
+        zip_path = _move_to_snap_dir(zip_path)
         save_version_record(site_tag, f"Site {site}", zip_path)
         st.success(f"Snapshot for '{site}' saved: {os.path.basename(zip_path)}")
     if cols[2].button("Restore latest for site"):
@@ -1162,7 +1191,7 @@ def view_versions():
         st.dataframe(pd.DataFrame(versions), use_container_width=True, height=300)
     else:
         st.info("No versions yet.")
-    st.caption("Snapshot files in /snapshots:")
+    st.caption("Snapshot files in current folder:")
     st.write([os.path.basename(p) for p in _zip_list()])
 
 
@@ -1268,134 +1297,135 @@ def view_reports():
 
     if not FPDF_AVAILABLE:
         st.error("PDF engine not available. Add `fpdf2==2.7.9` to requirements.txt.")
+        return
+
+    st.subheader("Inventory Report")
+    items = get_items()
+    df_items = pd.DataFrame(items)
+    if "category" in df_items.columns:
+        df_items["category"] = df_items["category"].apply(normalize_category)
+
+    categories = sorted([c for c in df_items.get("category", pd.Series(dtype=str)).dropna().unique().tolist()])
+    cat_select = st.multiselect("Categories to include", options=categories, default=categories)
+    only_available = st.checkbox("Only available items (> 0 qty)", value=False)
+    only_low = st.checkbox("Only low-stock rows", value=False)
+    sort_by = st.selectbox("Sort by", options=["category","sku","name"], index=0)
+
+    if not df_items.empty:
+        use_cats = cat_select if cat_select else None
+        pdf_bytes = _inventory_pdf_bytes_grouped(
+            df_items, brand_name, brand_rgb, logo_path, revision_tag,
+            prepared_by=prepared_by, checked_by=checked_by, approved_by=approved_by,
+            only_low=only_low, sort_by=sort_by, categories=use_cats, only_available=only_available
+        )
+        st.download_button(
+            "Download Inventory PDF",
+            data=pdf_bytes,
+            file_name=f"inventory_{timestamp()}.pdf",
+            mime="application/pdf",
+        )
     else:
-        st.subheader("Inventory Report")
-        items = get_items()
-        df_items = pd.DataFrame(items)
-        if "category" in df_items.columns:
-            df_items["category"] = df_items["category"].apply(normalize_category)
+        st.info("No items to include in the report.")
 
-        categories = sorted([c for c in df_items.get("category", pd.Series(dtype=str)).dropna().unique().tolist()])
-        cat_select = st.multiselect("Categories to include", options=categories, default=categories)
-        only_available = st.checkbox("Only available items (> 0 qty)", value=False)
-        only_low = st.checkbox("Only low-stock rows", value=False)
-        sort_by = st.selectbox("Sort by", options=["category","sku","name"], index=0)
+    st.subheader("Transaction Log (PDF)")
+    tx = get_transactions(limit=100_000)
+    df_tx = pd.DataFrame(tx)
+    if df_tx.empty:
+        st.info("No transactions to include in the report.")
+        return
 
-        if not df_items.empty:
-            use_cats = cat_select if cat_select else None
-            pdf_bytes = _inventory_pdf_bytes_grouped(
-                df_items, brand_name, brand_rgb, logo_path, revision_tag,
-                prepared_by=prepared_by, checked_by=checked_by, approved_by=approved_by,
-                only_low=only_low, sort_by=sort_by, categories=use_cats, only_available=only_available
-            )
-            st.download_button(
-                "Download Inventory PDF",
-                data=pdf_bytes,
-                file_name=f"inventory_{timestamp()}.pdf",
-                mime="application/pdf",
-            )
-        else:
-            st.info("No items to include in the report.")
+    def df_to_pdf_bytes_pro(title: str, df: pd.DataFrame, meta_lines, brand_name: str, brand_rgb: tuple, logo_path: str, revision_tag: str) -> bytes:
+        pdf = BrandedPDF(
+            brand_name=brand_name, brand_rgb=brand_rgb, logo_path=logo_path, revision_tag=revision_tag,
+            orientation="L", unit="mm", format="A3"
+        )
+        pdf.add_page()
+        pdf.set_text_color(30, 30, 30)
+        pdf.set_font("Helvetica", "B", 16)
+        pdf.cell(0, 10, to_latin1(title), ln=1)
+        pdf.set_font("Helvetica", "", 10)
+        pdf.cell(0, 6, to_latin1(f"Date Issued: {dt.datetime.now().strftime('%Y-%m-%d %H:%M')}"), ln=1)
+        for line in meta_lines:
+            pdf.cell(0, 6, to_latin1(str(line)), ln=1)
+        pdf.ln(2)
 
-        st.subheader("Transaction Log (PDF)")
-        tx = get_transactions(limit=100_000)
-        df_tx = pd.DataFrame(tx)
-        if df_tx.empty:
-            st.info("No transactions to include in the report.")
-            return
-
-        def df_to_pdf_bytes_pro(title: str, df: pd.DataFrame, meta_lines, brand_name: str, brand_rgb: tuple, logo_path: str, revision_tag: str) -> bytes:
-            pdf = BrandedPDF(
-                brand_name=brand_name, brand_rgb=brand_rgb, logo_path=logo_path, revision_tag=revision_tag,
-                orientation="L", unit="mm", format="A3"
-            )
-            pdf.add_page()
-            pdf.set_text_color(30, 30, 30)
-            pdf.set_font("Helvetica", "B", 16)
-            pdf.cell(0, 10, to_latin1(title), ln=1)
-            pdf.set_font("Helvetica", "", 10)
-            pdf.cell(0, 6, to_latin1(f"Date Issued: {dt.datetime.now().strftime('%Y-%m-%d %H:%M')}"), ln=1)
-            for line in meta_lines:
-                pdf.cell(0, 6, to_latin1(str(line)), ln=1)
-            pdf.ln(2)
-
-            def draw_table(pdf, df: pd.DataFrame, header_fill_rgb: tuple, font_size=9):
-                pdf.set_font("Helvetica", "B", font_size)
-                page_w = pdf.w - pdf.l_margin - pdf.r_margin
-                measure_rows = min(len(df), 200)
-                widths = []
-                for col in df.columns:
-                    max_w = pdf.get_string_width(to_latin1(str(col))) + 6
-                    pdf.set_font("Helvetica", "", font_size)
-                    for i in range(measure_rows):
-                        w = pdf.get_string_width(to_latin1(str(df.iloc[i][col]))) + 6
-                        if w > max_w:
-                            max_w = w
-                    max_w = max(18, min(max_w, 100))
-                    widths.append(max_w)
-                total_w = sum(widths)
-                if total_w > page_w:
-                    scale = page_w / total_w
-                    widths = [w * scale for w in widths]
-                else:
-                    extra = page_w - total_w
-                    if extra > 0 and len(widths) > 0:
-                        bump = extra / len(widths)
-                        widths = [w + bump for w in widths]
-
-                pdf.set_font("Helvetica", "B", font_size)
-                pdf.set_fill_color(*lighten(header_fill_rgb, 0.85))
-                pdf.set_text_color(20, 20, 20)
-                row_h = 7
-                y0 = pdf.get_y()
-                for w, col in zip(widths, df.columns):
-                    x = pdf.get_x()
-                    pdf.multi_cell(w, row_h, to_latin1(str(col)), border=1, align="L", fill=True, new_x="RIGHT", new_y="TOP")
-                    pdf.set_xy(x + w, y0)
-                pdf.ln(row_h)
-
+        def draw_table(pdf, df: pd.DataFrame, header_fill_rgb: tuple, font_size=9):
+            pdf.set_font("Helvetica", "B", font_size)
+            page_w = pdf.w - pdf.l_margin - pdf.r_margin
+            measure_rows = min(len(df), 200)
+            widths = []
+            for col in df.columns:
+                max_w = pdf.get_string_width(to_latin1(str(col))) + 6
                 pdf.set_font("Helvetica", "", font_size)
-                pdf.set_text_color(15, 15, 15)
-                for idx in range(len(df)):
-                    y_start = pdf.get_y()
-                    if y_start + row_h > pdf.h - pdf.b_margin:
-                        pdf.add_page()
-                        pdf.set_font("Helvetica", "B", font_size)
-                        pdf.set_fill_color(*lighten(header_fill_rgb, 0.85))
-                        pdf.set_text_color(20, 20, 20)
-                        y0 = pdf.get_y()
-                        for w, col in zip(widths, df.columns):
-                            x = pdf.get_x()
-                            pdf.multi_cell(w, row_h, to_latin1(str(col)), border=1, align="L", fill=True, new_x="RIGHT", new_y="TOP")
-                            pdf.set_xy(x + w, y0)
-                        pdf.ln(row_h)
-                        pdf.set_font("Helvetica", "", font_size)
-                        pdf.set_text_color(15, 15, 15)
-                        y_start = pdf.get_y()
+                for i in range(measure_rows):
+                    w = pdf.get_string_width(to_latin1(str(df.iloc[i][col]))) + 6
+                    if w > max_w:
+                        max_w = w
+                max_w = max(18, min(max_w, 100))
+                widths.append(max_w)
+            total_w = sum(widths)
+            if total_w > page_w:
+                scale = page_w / total_w
+                widths = [w * scale for w in widths]
+            else:
+                extra = page_w - total_w
+                if extra > 0 and len(widths) > 0:
+                    bump = extra / len(widths)
+                    widths = [w + bump for w in widths]
 
-                    x_left = pdf.get_x()
-                    for w, val in zip(widths, df.iloc[idx].tolist()):
-                        txt = to_latin1(str(val))
+            pdf.set_font("Helvetica", "B", font_size)
+            pdf.set_fill_color(*lighten(header_fill_rgb, 0.85))
+            pdf.set_text_color(20, 20, 20)
+            row_h = 7
+            y0 = pdf.get_y()
+            for w, col in zip(widths, df.columns):
+                x = pdf.get_x()
+                pdf.multi_cell(w, row_h, to_latin1(str(col)), border=1, align="L", fill=True, new_x="RIGHT", new_y="TOP")
+                pdf.set_xy(x + w, y0)
+            pdf.ln(row_h)
+
+            pdf.set_font("Helvetica", "", font_size)
+            pdf.set_text_color(15, 15, 15)
+            for idx in range(len(df)):
+                y_start = pdf.get_y()
+                if y_start + row_h > pdf.h - pdf.b_margin:
+                    pdf.add_page()
+                    pdf.set_font("Helvetica", "B", font_size)
+                    pdf.set_fill_color(*lighten(header_fill_rgb, 0.85))
+                    pdf.set_text_color(20, 20, 20)
+                    y0 = pdf.get_y()
+                    for w, col in zip(widths, df.columns):
                         x = pdf.get_x()
-                        pdf.multi_cell(w, row_h, txt, border=1, align="L", new_x="RIGHT", new_y="TOP")
-                        pdf.set_xy(x + w, y_start)
-                    pdf.set_xy(x_left, y_start + row_h)
+                        pdf.multi_cell(w, row_h, to_latin1(str(col)), border=1, align="L", fill=True, new_x="RIGHT", new_y="TOP")
+                        pdf.set_xy(x + w, y0)
+                    pdf.ln(row_h)
+                    pdf.set_font("Helvetica", "", font_size)
+                    pdf.set_text_color(15, 15, 15)
+                    y_start = pdf.get_y()
 
-            draw_table(pdf, df, brand_rgb, font_size=9)
-            data = pdf.output(dest="S")
-            return bytes(data) if isinstance(data, (bytes, bytearray)) else str(data).encode("latin-1", errors="ignore")
+                x_left = pdf.get_x()
+                for w, val in zip(widths, df.iloc[idx].tolist()):
+                    txt = to_latin1(str(val))
+                    x = pdf.get_x()
+                    pdf.multi_cell(w, row_h, txt, border=1, align="L", new_x="RIGHT", new_y="TOP")
+                    pdf.set_xy(x + w, y_start)
+                pdf.set_xy(x_left, y_start + row_h)
 
-        col_order = ["ts", "sku", "qty_change", "reason", "project", "reference", "user", "notes"]
-        col_names = {
-            "ts":"Timestamp","sku":"SKU","qty_change":"Δ Qty","reason":"Reason",
-            "project":"Project/Job","reference":"Reference","user":"User","notes":"Notes"
-        }
-        df_tx = df_tx.loc[:, [c for c in col_order if c in df_tx.columns]].rename(columns=col_names)
-        meta = [f"Rows: {len(df_tx)}"]
-        if prepared_by:
-            meta.append(f"Prepared by: {prepared_by}")
-        pdf_bytes_tx = df_to_pdf_bytes_pro("Transaction Log", df_tx, meta, brand_name, brand_rgb, logo_path, revision_tag)
-        st.download_button("Download Transactions PDF", data=pdf_bytes_tx, file_name=f"transactions_{timestamp()}.pdf", mime="application/pdf")
+        draw_table(pdf, df, brand_rgb, font_size=9)
+        data = pdf.output(dest="S")
+        return bytes(data) if isinstance(data, (bytes, bytearray)) else str(data).encode("latin-1", errors="ignore")
+
+    col_order = ["ts", "sku", "qty_change", "reason", "project", "reference", "user", "notes"]
+    col_names = {
+        "ts":"Timestamp","sku":"SKU","qty_change":"Δ Qty","reason":"Reason",
+        "project":"Project/Job","reference":"Reference","user":"User","notes":"Notes"
+    }
+    df_tx = df_tx.loc[:, [c for c in col_order if c in df_tx.columns]].rename(columns=col_names)
+    meta = [f"Rows: {len(df_tx)}"]
+    if prepared_by:
+        meta.append(f"Prepared by: {prepared_by}")
+    pdf_bytes_tx = df_to_pdf_bytes_pro("Transaction Log", df_tx, meta, brand_name, brand_rgb, logo_path, revision_tag)
+    st.download_button("Download Transactions PDF", data=pdf_bytes_tx, file_name=f"transactions_{timestamp()}.pdf", mime="application/pdf")
 
 
 def view_maintenance():
