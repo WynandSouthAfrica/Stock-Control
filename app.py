@@ -237,16 +237,19 @@ def _calc_row_height_exact(pdf, values, widths, row_h, wrap_idx_set):
     return max(heights) if heights else row_h
 
 def _truncate_to_fit(pdf, txt: str, w: float, margin: float = 2.0) -> str:
-    """Truncate text with ellipsis so it fits inside width w."""
+    """Truncate text with ASCII ellipsis so it fits inside width w (Latin-1 safe)."""
     if txt is None:
         return ""
     s = to_latin1(str(txt))
-    if pdf.get_string_width(s) <= max(1.0, w - margin):
+    maxw = max(1.0, w - margin)
+    if pdf.get_string_width(s) <= maxw:
         return s
-    ell = "…"
-    while s and pdf.get_string_width(s + ell) > max(1.0, w - margin):
+    ell = "..."  # ASCII-safe
+    if pdf.get_string_width(ell) > maxw:
+        return ""  # column too narrow even for dots
+    while s and pdf.get_string_width(s + ell) > maxw:
         s = s[:-1]
-    return (s + ell) if s else ""
+    return (s + ell) if s else ell
 
 def _draw_row(pdf, values, widths, row_h, align_map=None, fill_rgb=None, bold=False, text_rgb=(15,15,15), wrap_idx_set=None, border="1"):
     """Draw a row. Cells listed in wrap_idx_set can wrap (multi_cell). Others are single-line cells clipped with ellipsis."""
