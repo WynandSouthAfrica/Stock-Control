@@ -1,5 +1,5 @@
 # app.py — OMEC Stock Take (Streamlit)
-# Update: Inventory list auto-sorts by Category → SKU → Name (alphabetical).
+# Update: Removed Quick Edit box. Inventory list auto-sorts by Category → SKU → Name (alphabetical) and has a taller editor window.
 # (All other behavior/layout unchanged. Issue/Return sheets are A4 landscape with fit-to-width.)
 
 import os, json, re, io, zipfile, glob, math, shutil
@@ -855,7 +855,7 @@ def view_dashboard():
 
 def view_inventory():
     st.title("📦 Inventory")
-    st.caption("Add, edit, or delete items. Quick Edit helps fix mistakes (e.g., wrong category).")
+    st.caption("Add, edit, or delete items. Edit directly in the list below and then **Save Edits** to upsert visible rows.")
 
     items = get_items()
     df = pd.DataFrame(items)
@@ -933,6 +933,7 @@ def view_inventory():
             use_container_width=True,
             num_rows="dynamic",
             key="inv_editor",
+            height=900,  # expanded editor window
             column_config={
                 "quantity": st.column_config.NumberColumn(format="%.3f"),
                 "min_qty": st.column_config.NumberColumn(format="%.3f"),
@@ -960,47 +961,6 @@ def view_inventory():
             st.rerun()
     else:
         st.info("No items yet. Add your first item above.")
-
-    st.divider()
-    st.subheader("Quick Edit (fix a captured mistake)")
-    if not df.empty:
-        sku_pick = st.selectbox("Select SKU to edit", options=sorted(df["sku"].tolist()))
-        rec = df[df["sku"] == sku_pick].iloc[0]
-        with st.form("quick_edit"):
-            cols = st.columns(4)
-            q_name = cols[0].text_input("Name", value=rec.get("name",""))
-            q_cat  = cols[1].text_input("Category", value=str(rec.get("category") or ""))
-            q_loc  = cols[2].text_input("Location", value=str(rec.get("location") or ""))
-            q_unit = cols[3].text_input("Unit", value=str(rec.get("unit") or ""))
-
-            cols2 = st.columns(4)
-            q_qty  = cols2[0].number_input("Quantity", value=float(rec.get("quantity") or 0.0), step=1.0, format="%.3f")
-            q_min  = cols2[1].number_input("Min Qty", value=float(rec.get("min_qty") or 0.0), step=1.0, format="%.3f")
-            q_cost = cols2[2].number_input("Unit Cost (R)", value=float(rec.get("unit_cost") or 0.0), step=1.0, format="%.2f")
-            q_notes= cols2[3].text_input("Notes", value=str(rec.get("notes") or ""))
-
-            cols3 = st.columns(2)
-            q_conv_to = cols3[0].text_input("Convert to", value=str(rec.get("convert_to") or ""))
-            q_conv_fac= cols3[1].number_input("Conversion factor", value=float(rec.get("convert_factor") or 0.0), step=0.001, format="%.3f")
-
-            submit = st.form_submit_button("Apply Changes")
-            if submit:
-                add_or_update_item({
-                    "sku": sku_pick,
-                    "name": q_name,
-                    "category": normalize_category(q_cat),
-                    "location": q_loc or None,
-                    "unit": q_unit or None,
-                    "quantity": float(q_qty),
-                    "min_qty": float(q_min),
-                    "unit_cost": float(q_cost),
-                    "notes": q_notes or None,
-                    "convert_to": q_conv_to or None,
-                    "convert_factor": float(q_conv_fac or 0.0),
-                    "image_path": None,
-                })
-                st.success("Item updated.")
-                st.rerun()
 
     st.divider()
     colA, colB = st.columns(2)
