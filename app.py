@@ -1,4 +1,4 @@
-# app.py — OMEC Stock Take (Streamlit)
+# app.py — OpperWorks Stock Take (Streamlit)
 # Update: Currency formatting for Rand (comma thousands, dot cents) everywhere costs/values are displayed.
 # - PDFs already used ,/. formatting; confirmed and standardized.
 # - Dashboard metrics & tables now show Rand with commas.
@@ -25,7 +25,7 @@ try:
 except Exception:
     FPDF_AVAILABLE = False
 
-st.set_page_config(page_title="OMEC Stock Take", page_icon="🗃️", layout="wide")
+st.set_page_config(page_title="OpperWorks Stock Take", page_icon="🗃️", layout="wide")
 
 # ---------- Paths / helpers ----------
 ROOT = os.path.dirname(__file__)
@@ -136,7 +136,7 @@ if os.path.exists(CONFIG_PATH):
     with open(CONFIG_PATH, "r") as f:
         CONFIG = json.load(f)
 else:
-    CONFIG = {"brand_name": "OMEC", "brand_color": "#0ea5e9", "logo_path": "", "revision_tag": "Rev0.1"}
+    CONFIG = {"brand_name": "OpperWorks", "brand_color": "#0ea5e9", "logo_path": "", "revision_tag": "Rev0.1"}
 
 DEFAULT_SNAP_DIR = os.path.join(ROOT, "snapshots")
 _saved_snap = get_setting("snap_dir", DEFAULT_SNAP_DIR) or DEFAULT_SNAP_DIR
@@ -145,7 +145,7 @@ os.makedirs(SNAP_DIR, exist_ok=True)
 
 # ---------- Settings ----------
 logo_path = get_setting("logo_path", CONFIG.get("logo_path", ""))
-brand_name = get_setting("brand_name", CONFIG.get("brand_name", "OMEC"))
+brand_name = get_setting("brand_name", CONFIG.get("brand_name", "OpperWorks"))
 brand_color = get_setting("brand_color", CONFIG.get("brand_color", "#0ea5e9"))
 revision_tag = get_setting("revision_tag", CONFIG.get("revision_tag", "Rev0.1"))
 prepared_by = get_setting("prepared_by", "")
@@ -155,16 +155,27 @@ email_recipients = get_setting("email_recipients", "")
 auto_backup_enabled = str(get_setting("auto_backup_enabled", "true")).lower() in {"1","true","yes","on"}
 brand_rgb = hex_to_rgb(brand_color)
 
-# Try auto-detect bundled PG Bison logo on first run
+# Try auto-detect bundled OpperWorks logo (preferred) or PG Bison logo on first run
 if not logo_path:
     try:
-        pg_bison_src = "/mnt/data/PG Bison.jpg"
-        if os.path.exists(pg_bison_src):
-            dst = os.path.join(ASSETS_DIR, "brand_logo.jpg")
+        # Preferred: OpperWorks brand logo
+        opp_src = "/mnt/data/Logo R0.1.png"
+        if os.path.exists(opp_src):
+            ext = os.path.splitext(opp_src)[1] or ".png"
+            dst = os.path.join(ASSETS_DIR, f"brand_logo{ext}")
             if not os.path.exists(dst):
-                shutil.copyfile(pg_bison_src, dst)
+                shutil.copyfile(opp_src, dst)
             upsert_setting("logo_path", dst)
             logo_path = dst
+        else:
+            # Fallback: PG Bison logo
+            pg_bison_src = "/mnt/data/PG Bison.jpg"
+            if os.path.exists(pg_bison_src):
+                dst = os.path.join(ASSETS_DIR, "brand_logo.jpg")
+                if not os.path.exists(dst):
+                    shutil.copyfile(pg_bison_src, dst)
+                upsert_setting("logo_path", dst)
+                logo_path = dst
     except Exception:
         pass
 
