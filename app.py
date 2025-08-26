@@ -1,12 +1,9 @@
 # app.py — OpperWorks Stock Take (Streamlit)
 # === What’s new in this build ===
-# • Serial Number now sticks after Save:
-#     - Tries to patch SQLite schema to add items.serial_no (safe/no-op).
-#     - ALSO adds a compatibility fallback using a Settings-backed map so serials persist
-#       even if your db.py doesn’t store the column yet.
-#     - Rename/Delete keeps serials in sync.
-#     - Snapshots/Auto-backup include serials.
-# • Inventory grid keeps “add-as-you-go”, supports renaming SKU, and warns on rows missing SKU/Name.
+# 1) Inventory: quick “Find by Serial #” filter (works with the regular text filter).
+# 2) Duplicate-serial warning (toggle + optional “block save on duplicates”).
+# 3) Better long-text editing: Name & Notes use multi-line cells that wrap/stack.
+#    (PDFs/snapshots continue to include Serial #; rename/delete keeps serials in sync.)
 
 import os, json, re, io, zipfile, glob, math, shutil, sqlite3
 import datetime as dt
@@ -151,7 +148,6 @@ brand_rgb = hex_to_rgb(brand_color)
 
 # ---------- Serial Number: schema + compatibility layer ----------
 def _db_candidates_from_module():
-    """Try to locate the sqlite file used by db.py. Best-effort."""
     paths = []
     try:
         import db as _db
@@ -170,8 +166,6 @@ def _db_candidates_from_module():
     return [p for p in uniq if os.path.exists(p)]
 
 def _ensure_serialno_column(show_toast=False) -> bool:
-    """Add items.serial_no TEXT if missing. Safe/no-op; returns True if present."""
-    # quick check: does get_items() already return serial_no?
     try:
         sample = get_items() or []
         if sample and "serial_no" in sample[0]:
@@ -196,7 +190,6 @@ def _ensure_serialno_column(show_toast=False) -> bool:
         st.toast("Could not auto-add items.serial_no (compat fallback will be used).", icon="⚠️")
     return False
 
-# Settings-backed fallback map (works even if db.py ignores serial_no)
 def _load_serial_map() -> dict:
     try:
         raw = get_setting("serial_map", "{}") or "{}"
@@ -212,7 +205,6 @@ def _save_serial_map(m: dict):
         pass
 
 def _overlay_serials(items: list[dict]) -> list[dict]:
-    """Overlay serial_no from settings map where DB doesn't supply one."""
     m = _load_serial_map()
     out = []
     for it in items:
@@ -240,10 +232,9 @@ def _rename_serial_in_map(old_sku: str, new_sku: str):
         m[new_sku] = m.pop(old_sku)
         _save_serial_map(m)
 
-# Run once on app start (safe). Even if this fails, fallback map will persist serials.
 _ensure_serialno_column(show_toast=False)
 
-# Try auto-detect bundled logos on first run
+# Auto-detect logo once
 if not logo_path:
     try:
         opp_src = "/mnt/data/Logo R0.1.png"
@@ -342,7 +333,6 @@ def _has_snapshot_for_today():
 
 if auto_backup_enabled and not _has_snapshot_for_today():
     try:
-        # include serial overlay in backups
         items = get_items_with_serial()
         tx = get_transactions(limit=1_000_000)
         path = export_snapshot(items, tx, tag=f"Auto_{dt.date.today().isoformat()}", note="Auto-backup on app open")
@@ -713,7 +703,7 @@ def _issue_sheet_pdf_bytes(
 
     present = ["sku","serial_no","name","unit","quantity","min_qty"]
     col_map = {"sku":"SKU","serial_no":"Serial #","name":"Item","unit":"Unit","quantity":"On-hand","min_qty":"Min"}
-    display_cols = [col_map[c] for c in present if c in df.columns or c in ("sku","name","unit","quantity","min_qty","serial_no")] + ["Qty Issued", "To (Person)", "Signature", "Date"]
+    display_cols = [col_map[c] for c in present if c in df.columns or c in present] + ["Qty Issued", "To (Person)", "Signature", "Date"]
 
     rows_for_width = []
     for _, r in df.iterrows():
@@ -983,31 +973,41 @@ def view_dashboard():
 
 def view_inventory():
     st.title("📦 Inventory")
-    st.caption("Add as you go: insert blank rows below, type, and **Save**. Deleting rows removes them; editing SKU renames.")
+    st.caption("Add as you go: insert blank rows, type, and **Save**. Delete rows to remove. Editing SKU performs a rename.")
     _ensure_serialno_column(show_toast=False)
 
     if "inv_new_rows" not in st.session_state:
         st.session_state.inv_new_rows = 0
 
+    # ---- Filters
     items = get_items_with_serial()
     df = pd.DataFrame(items)
     if "category" in df.columns:
         df["category"] = df["category"].apply(normalize_category)
 
-    filt = st.text_input("Filter (SKU/Serial/Name/Category/Location contains…)")
+    with st.container():
+        cA, cB, cC = st.columns([2,4,4])
+        serial_find = cA.text_input("🔎 Find by Serial #", placeholder="Type full/part of serial…")
+        filt = cB.text_input("Filter (SKU/Serial/Name/Category/Location contains…)")
+        dup_warn_toggle = cC.toggle("Warn on duplicate serials", value=True, help="Shows a warning if the grid contains duplicate Serial # values (ignores blanks).")
+
     fdf = df.copy()
     for col in ["sku","serial_no","name","category","location","unit","quantity","min_qty","unit_cost","convert_to","convert_factor","notes","updated_at"]:
         if col not in fdf.columns:
             fdf[col] = None
 
+    if serial_find:
+        s = serial_find.lower().strip()
+        fdf = fdf[fdf["serial_no"].astype(str).str.lower().str.contains(s, na=False)]
+
     if filt:
         f = filt.lower()
         mask = (
-            fdf["sku"].astype(str).str.lower().str.contains(f) |
-            fdf["serial_no"].astype(str).str.lower().str.contains(f) |
-            fdf["name"].astype(str).str.lower().str.contains(f) |
-            fdf["category"].astype(str).str.lower().str.contains(f) |
-            fdf["location"].astype(str).str.lower().str.contains(f)
+            fdf["sku"].astype(str).str.lower().str.contains(f, na=False) |
+            fdf["serial_no"].astype(str).str.lower().str.contains(f, na=False) |
+            fdf["name"].astype(str).str.lower().str.contains(f, na=False) |
+            fdf["category"].astype(str).str.lower().str.contains(f, na=False) |
+            fdf["location"].astype(str).str.lower().str.contains(f, na=False)
         )
         fdf = fdf[mask]
 
@@ -1036,10 +1036,11 @@ def view_inventory():
         blanks = pd.DataFrame([_blank_row_dict() for _ in range(st.session_state.inv_new_rows)])
         fdf = pd.concat([fdf, blanks], ignore_index=True)
 
+    # --- Columns: use TextArea for long text (wrap/stack)
     column_config = {
         "sku": st.column_config.TextColumn("SKU", help="Required"),
         "serial_no": st.column_config.TextColumn("Serial Number"),
-        "name": st.column_config.TextColumn("Name", help="Required"),
+        "name": st.column_config.TextAreaColumn("Name", help="Required", rows=2),
         "category": st.column_config.TextColumn("Category"),
         "location": st.column_config.TextColumn("Location"),
         "unit": st.column_config.TextColumn("Unit"),
@@ -1048,7 +1049,7 @@ def view_inventory():
         "unit_cost": st.column_config.NumberColumn(format="%.2f"),
         "convert_to": st.column_config.TextColumn("Convert To"),
         "convert_factor": st.column_config.NumberColumn(format="%.3f"),
-        "notes": st.column_config.TextColumn("Notes"),
+        "notes": st.column_config.TextAreaColumn("Notes", rows=3),
         "updated_at": st.column_config.TextColumn("Updated", help="Auto"),
         "_orig_sku": st.column_config.TextColumn("Original SKU", help="Used for renames; read-only", disabled=True, width="small"),
     }
@@ -1065,15 +1066,40 @@ def view_inventory():
         column_config=column_config
     )
 
+    # live duplicate serial warning (optional)
+    try:
+        ser = edited["serial_no"].astype(str).str.strip()
+        ser = ser[ser != ""]
+        dup_vals = ser[ser.duplicated(keep=False)]
+        if dup_warn_toggle and len(dup_vals) > 0:
+            dups = sorted(set(dup_vals.tolist()))
+            st.warning(f"Duplicate Serial # detected in the grid: {', '.join(dups)}")
+    except Exception:
+        pass
+
+    # Missing required fields warning
     try:
         missing_mask = (edited["sku"].astype(str).str.strip() == "") | (edited["name"].astype(str).str.strip() == "")
         wont_save = int(missing_mask.sum())
         if wont_save > 0:
-            st.warning(f"{wont_save} row(s) are missing SKU or Name and will be skipped on Save.")
+            st.info(f"{wont_save} row(s) missing SKU or Name will be skipped on Save.")
     except Exception:
         pass
 
+    block_on_dup = st.checkbox("Block save on duplicates (Serial #)", value=False, help="If enabled, Save will abort when duplicate Serial # values are present (ignores blanks).")
+
     if add_cols[3].button("💾 Save (Upsert / Rename / Delete removed)"):
+        # block if requested and duplicates present
+        try:
+            ser = edited["serial_no"].astype(str).str.strip()
+            ser = ser[ser != ""]
+            has_dups = ser.duplicated().any()
+        except Exception:
+            has_dups = False
+        if block_on_dup and has_dups:
+            st.error("Save blocked: duplicate Serial # values present. Resolve and try again.")
+            return
+
         original_skus = set(df["sku"].astype(str).tolist()) if not df.empty else set()
         edited = edited.fillna({"sku":"", "name":"", "_orig_sku":"", "serial_no":""})
 
@@ -1112,7 +1138,6 @@ def view_inventory():
                 continue
             seen_targets.add(new_sku)
 
-            # Upsert via db.py
             if orig_sku and new_sku != orig_sku and orig_sku in original_skus:
                 try:
                     delete_item(orig_sku)
@@ -1128,7 +1153,6 @@ def view_inventory():
                     upserts += 1
                 add_or_update_item(payload)
 
-            # Ensure serial persists via fallback map
             _set_or_clear_serial_in_map(new_sku, payload.get("serial_no"))
 
         kept_orig_skus = set(edited["_orig_sku"].astype(str).tolist()) if "_orig_sku" in edited.columns else set()
@@ -1325,7 +1349,7 @@ def view_versions():
     tag = st.text_input("Version tag (e.g., V0.1, 'after_stock_count')")
     note = st.text_area("Note")
     if st.button("Create Snapshot ZIP"):
-        items = get_items_with_serial()  # include serials
+        items = get_items_with_serial()
         tx = get_transactions(limit=1_000_000)
         zip_path = export_snapshot(items, tx, tag=tag, note=note)
         zip_path = _move_to_snap_dir(zip_path, SNAP_DIR)
@@ -1410,7 +1434,6 @@ def _restore_from_bytes(zip_bytes: bytes, replace_items: bool, append_tx: bool, 
                 delete_item(it["sku"])
             except Exception:
                 pass
-        # also clear serial map for safety
         _save_serial_map({})
 
     added_items = 0
@@ -1432,7 +1455,6 @@ def _restore_from_bytes(zip_bytes: bytes, replace_items: bool, append_tx: bool, 
                 "convert_factor": float(r.get("convert_factor") or 0) if "convert_factor" in inv_df.columns else 0.0,
                 "image_path": None,
             })
-            # ensure serial recorded in fallback map as well
             _set_or_clear_serial_in_map(str(r.get("sku") or "").strip(), serial_val)
             added_items += 1
         except Exception as e:
