@@ -1,9 +1,9 @@
 # app.py — OpperWorks Stock Take (Streamlit)
 # === What’s new in this build ===
-# 1) Inventory: quick “Find by Serial #” filter (works with the regular text filter).
-# 2) Duplicate-serial warning (toggle + optional “block save on duplicates”).
-# 3) Better long-text editing: Name & Notes use multi-line cells that wrap/stack.
-#    (PDFs/snapshots continue to include Serial #; rename/delete keeps serials in sync.)
+# - Fix: compatible with Streamlit versions that don’t have TextAreaColumn.
+#   * Falls back to TextColumn + CSS-based wrapping for long text.
+# - Keeps: Serial# quick find, duplicate-serial warning/block, add-rows, rename/delete-on-save,
+#          Serial# in PDFs/snapshots.
 
 import os, json, re, io, zipfile, glob, math, shutil, sqlite3
 import datetime as dt
@@ -988,7 +988,7 @@ def view_inventory():
     with st.container():
         cA, cB, cC = st.columns([2,4,4])
         serial_find = cA.text_input("🔎 Find by Serial #", placeholder="Type full/part of serial…")
-        filt = cB.text_input("Filter (SKU/Serial/Name/Category/Location contains…)")
+        filt = cB.text_input("Filter (SKU/Serial/Name/Category/Location contains…")
         dup_warn_toggle = cC.toggle("Warn on duplicate serials", value=True, help="Shows a warning if the grid contains duplicate Serial # values (ignores blanks).")
 
     fdf = df.copy()
@@ -1036,11 +1036,32 @@ def view_inventory():
         blanks = pd.DataFrame([_blank_row_dict() for _ in range(st.session_state.inv_new_rows)])
         fdf = pd.concat([fdf, blanks], ignore_index=True)
 
-    # --- Columns: use TextArea for long text (wrap/stack)
+    # --- Columns: TextAreaColumn if available; else TextColumn + CSS wrap
+    has_textarea = hasattr(st.column_config, "TextAreaColumn")
+    if has_textarea:
+        name_col = st.column_config.TextAreaColumn("Name", help="Required", rows=2)
+        notes_col = st.column_config.TextAreaColumn("Notes", rows=3)
+    else:
+        name_col = st.column_config.TextColumn("Name", help="Required")
+        notes_col = st.column_config.TextColumn("Notes")
+        st.markdown(
+            """
+            <style>
+              /* wrap grid cells for older Streamlit builds */
+              [data-testid="stDataFrame"] div[role="gridcell"] {
+                  white-space: normal !important;
+                  line-height: 1.2rem !important;
+                  overflow-wrap: anywhere !important;
+              }
+            </style>
+            """,
+            unsafe_allow_html=True,
+        )
+
     column_config = {
         "sku": st.column_config.TextColumn("SKU", help="Required"),
         "serial_no": st.column_config.TextColumn("Serial Number"),
-        "name": st.column_config.TextAreaColumn("Name", help="Required", rows=2),
+        "name": name_col,
         "category": st.column_config.TextColumn("Category"),
         "location": st.column_config.TextColumn("Location"),
         "unit": st.column_config.TextColumn("Unit"),
@@ -1049,7 +1070,7 @@ def view_inventory():
         "unit_cost": st.column_config.NumberColumn(format="%.2f"),
         "convert_to": st.column_config.TextColumn("Convert To"),
         "convert_factor": st.column_config.NumberColumn(format="%.3f"),
-        "notes": st.column_config.TextAreaColumn("Notes", rows=3),
+        "notes": notes_col,
         "updated_at": st.column_config.TextColumn("Updated", help="Auto"),
         "_orig_sku": st.column_config.TextColumn("Original SKU", help="Used for renames; read-only", disabled=True, width="small"),
     }
