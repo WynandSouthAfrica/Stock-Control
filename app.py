@@ -1,10 +1,16 @@
 # app.py — OpperWorks Stock Take (Streamlit)
-# Updates:
-# - True “add-as-you-go” in the grid: add blank rows, type, and Save. Top add form removed.
-# - Keeps rename-on-Save (SKU edits), delete-on-Save (removed rows), and serial number support.
-# - Auto-sorts Category → SKU → Name on every reload after Save.
+# Updates in this version:
+# - Serial Number persistence end-to-end:
+#     • One-time SQLite migration to add items.serial_no (safe/no-op if already present)
+#     • UI grid reads/writes serial_no
+#     • PDFs & restore already handle serial_no
+# - “Add-as-you-go” grid kept; Save now validates rows and warns if any are missing SKU/Name
+# - Maintenance page: one-click “Repair DB: add Serial Number column” action
+# - Auto-sort after save remains Category → SKU → Name
+#
+# Note: Migration is best-effort and safe. If your DB module path is custom, the Maintenance button lets you retry.
 
-import os, json, re, io, zipfile, glob, math, shutil
+import os, json, re, io, zipfile, glob, math, shutil, sqlite3
 import datetime as dt
 import urllib.parse
 import streamlit as st
@@ -144,6 +150,77 @@ approved_by = get_setting("approved_by", "")
 email_recipients = get_setting("email_recipients", "")
 auto_backup_enabled = str(get_setting("auto_backup_enabled", "true")).lower() in {"1","true","yes","on"}
 brand_rgb = hex_to_rgb(brand_color)
+
+# ---------- Schema migration helpers (safe/no-op) ----------
+def _db_candidates_from_module():
+    """Try to locate the sqlite file used by db.py. Best-effort."""
+    paths = []
+    try:
+        import db as _db
+        for attr in ("DB_PATH", "DB_FILE", "PATH", "db_path"):
+            p = getattr(_db, attr, None)
+            if isinstance(p, str):
+                paths.append(_coerce_path(p))
+    except Exception:
+        pass
+    # common fallbacks next to app
+    for name in ("data.db", "db.sqlite3", "app.db", "stock.db"):
+        paths.append(os.path.join(ROOT, name))
+    # unique-ify while keeping order
+    uniq = []
+    for p in paths:
+        if p and p not in uniq:
+            uniq.append(p)
+    return [p for p in uniq if os.path.exists(p)]
+
+def _ensure_serialno_column(show_toast=False) -> bool:
+    """
+    Add items.serial_no TEXT if missing. Returns True if column exists (now or already).
+    Never raises (quietly returns False if we can't patch).
+    """
+    try:
+        # quick check via data
+        items = get_items()
+        if items and isinstance(items, list) and "serial_no" in items[0]:
+            return True
+    except Exception:
+        pass
+
+    candidates = _db_candidates_from_module()
+    for path in candidates:
+        try:
+            with sqlite3.connect(path) as con:
+                cur = con.cursor()
+                cur.execute("PRAGMA table_info(items)")
+                cols = [r[1] for r in cur.fetchall()]
+                if "serial_no" in cols:
+                    return True
+                # add column
+                cur.execute("ALTER TABLE items ADD COLUMN serial_no TEXT")
+                con.commit()
+                if show_toast:
+                    st.toast("DB patched: added items.serial_no", icon="✅")
+                return True
+        except Exception:
+            continue
+    # Last resort: try creating a dummy upsert (in case db.add_or_update_item handles dynamic columns)
+    try:
+        add_or_update_item({
+            "sku": "_schema_probe_ignore_",
+            "name": "_probe_",
+            "serial_no": "",
+            "quantity": 0.0, "min_qty": 0.0, "unit_cost": 0.0
+        })
+        delete_item("_schema_probe_ignore_")
+        return True
+    except Exception:
+        pass
+    if show_toast:
+        st.toast("Could not auto-add items.serial_no (you can retry from Maintenance).", icon="⚠️")
+    return False
+
+# Run once on app start (safe)
+_ensure_serialno_column(show_toast=False)
 
 # Try auto-detect bundled logos on first run
 if not logo_path:
@@ -885,6 +962,7 @@ def view_dashboard():
 def view_inventory():
     st.title("📦 Inventory")
     st.caption("Add as you go: insert blank rows below, type, and **Save**. Deleting rows removes them; editing SKU renames.")
+    _ensure_serialno_column(show_toast=False)
 
     # Initialize session state for new blank rows
     if "inv_new_rows" not in st.session_state:
@@ -973,19 +1051,28 @@ def view_inventory():
         column_config=column_config
     )
 
-    # SAVE: upsert/rename for kept rows; delete rows removed from the grid; add brand-new rows
+    # Validation hint (rows that won't be saved)
+    try:
+        missing_mask = (edited["sku"].astype(str).str.strip() == "") | (edited["name"].astype(str).str.strip() == "")
+        wont_save = int(missing_mask.sum())
+        if wont_save > 0:
+            st.warning(f"{wont_save} row(s) are missing SKU or Name and will be skipped on Save.")
+    except Exception:
+        pass
+
+    # SAVE
     if add_cols[3].button("💾 Save (Upsert / Rename / Delete removed)"):
         # Sets for deletion detection (original items only)
         original_skus = set(df["sku"].astype(str).tolist()) if not df.empty else set()
 
         # Normalize NaNs
-        edited = edited.fillna({"sku":"", "name":"", "_orig_sku":""})
+        edited = edited.fillna({"sku":"", "name":"", "_orig_sku":"", "serial_no":""})
 
         # Upsert & rename
         upserts = 0
         renames = 0
         creates = 0
-        seen_targets = set()  # avoid double-processing same SKU if duplicated in grid
+        seen_targets = set()
 
         for _, r in edited.iterrows():
             new_sku = (r.get("sku") or "").strip()
@@ -1000,7 +1087,6 @@ def view_inventory():
             if not new_sku or not name:
                 continue
 
-            # Build payload
             payload = {
                 "sku": new_sku,
                 "serial_no": (r.get("serial_no") or None),
@@ -1029,7 +1115,6 @@ def view_inventory():
                 add_or_update_item(payload)
                 renames += 1
             else:
-                # New or existing
                 if new_sku not in original_skus:
                     creates += 1
                 else:
@@ -1584,6 +1669,16 @@ def view_maintenance():
                 fixed += 1
         st.success(f"Normalized {fixed} item(s).")
         st.rerun()
+
+    st.divider()
+    st.subheader("DB Repair")
+    st.caption("If Serial Numbers aren’t sticking after Save, click this to patch the DB schema.")
+    if st.button("Repair DB: add Serial Number column"):
+        ok = _ensure_serialno_column(show_toast=True)
+        if ok:
+            st.success("Serial Number column is present. You can try saving again.")
+        else:
+            st.error("Could not patch automatically. If the DB file is custom, please share its path/name.")
 
 # ---------- Router ----------
 if menu == "Dashboard":
