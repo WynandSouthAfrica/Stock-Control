@@ -1,9 +1,8 @@
 # app.py — OpperWorks Stock Take (Streamlit)
 # === What’s new in this build ===
-# - Fix: compatible with Streamlit versions that don’t have TextAreaColumn.
-#   * Falls back to TextColumn + CSS-based wrapping for long text.
-# - Keeps: Serial# quick find, duplicate-serial warning/block, add-rows, rename/delete-on-save,
-#          Serial# in PDFs/snapshots.
+# - PDF text wrapping: Item/Name and Notes now wrap onto multiple lines in BOTH
+#   Inventory Report and Issue/Return sheets (A3/A4 PDFs). No truncation with “…”.
+# - Everything else unchanged: Serial# features, add-rows, rename/delete-on-save.
 
 import os, json, re, io, zipfile, glob, math, shutil, sqlite3
 import datetime as dt
@@ -580,8 +579,12 @@ def _inventory_pdf_bytes_grouped(
     for c in ("quantity", "min_qty", "unit_cost", "value", "converted_qty"):
         if c in present:
             align_map[present.index(c)] = "R"
+
+    # --- WRAP Name and Notes in PDF ---
     wrap_idx_set = set()
-    if "notes" in present:
+    if "Name" in display_cols:
+        wrap_idx_set.add(display_cols.index("Name"))
+    if "Notes" in display_cols:
         wrap_idx_set.add(display_cols.index("Notes"))
 
     if "category" in df.columns:
@@ -768,6 +771,11 @@ def _issue_sheet_pdf_bytes(
     if "Min" in display_cols:     align_map[display_cols.index("Min")]     = "R"
     cat_bar = lighten(brand_rgb, 0.80)
 
+    # wrap the Item column on Issue sheet
+    wrap_issue_idx = set()
+    if "Item" in display_cols:
+        wrap_issue_idx.add(display_cols.index("Item"))
+
     if "category" in df.columns:
         df = df.sort_values(by=["category","sku","name"], kind="stable")
         groups = df["category"].fillna("(Unspecified)").unique().tolist()
@@ -806,7 +814,7 @@ def _issue_sheet_pdf_bytes(
             }
             values = [values_map[col] for col in display_cols]
             _ensure_page_space(pdf, 8, display_cols, widths, 9, brand_rgb)
-            _draw_row(pdf, values, widths, 7, align_map=align_map, border="1", wrap_idx_set=set())
+            _draw_row(pdf, values, widths, 7, align_map=align_map, border="1", wrap_idx_set=wrap_issue_idx)
 
             blanks = (fixed_blanks if (fixed_blanks is not None and fixed_blanks > 0)
                       else min(max(0, int(math.floor(onhand))) + 1, max(1, int(blanks_cap))))
@@ -853,6 +861,11 @@ def _issue_sheet_pdf_bytes(
 
         _draw_header_row(pdf, ret_cols, ret_widths, 9, brand_rgb)
 
+        # wrap Item and Condition/Notes on Return sheet
+        wrap_return_idx = set()
+        if "Item" in ret_cols: wrap_return_idx.add(ret_cols.index("Item"))
+        if "Condition / Notes" in ret_cols: wrap_return_idx.add(ret_cols.index("Condition / Notes"))
+
         cat_bar = lighten(brand_rgb, 0.80)
         groups2 = [x["cat"] for x in per_item_blanks]
         groups2 = list(dict.fromkeys(groups2))
@@ -883,7 +896,7 @@ def _issue_sheet_pdf_bytes(
                 }
                 desc_vals = [desc_vals_map[c] for c in ret_cols]
                 _ensure_page_space(pdf, 8, ret_cols, ret_widths, 9, brand_rgb)
-                _draw_row(pdf, desc_vals, ret_widths, 7, border="1", wrap_idx_set=set())
+                _draw_row(pdf, desc_vals, ret_widths, 7, border="1", wrap_idx_set=wrap_return_idx)
 
                 r_blanks = it["blanks"] if (fixed_return_blanks is None or fixed_return_blanks <= 0) else fixed_return_blanks
                 for _ in range(r_blanks):
@@ -1036,7 +1049,6 @@ def view_inventory():
         blanks = pd.DataFrame([_blank_row_dict() for _ in range(st.session_state.inv_new_rows)])
         fdf = pd.concat([fdf, blanks], ignore_index=True)
 
-    # --- Columns: TextAreaColumn if available; else TextColumn + CSS wrap
     has_textarea = hasattr(st.column_config, "TextAreaColumn")
     if has_textarea:
         name_col = st.column_config.TextAreaColumn("Name", help="Required", rows=2)
@@ -1047,7 +1059,6 @@ def view_inventory():
         st.markdown(
             """
             <style>
-              /* wrap grid cells for older Streamlit builds */
               [data-testid="stDataFrame"] div[role="gridcell"] {
                   white-space: normal !important;
                   line-height: 1.2rem !important;
@@ -1087,7 +1098,6 @@ def view_inventory():
         column_config=column_config
     )
 
-    # live duplicate serial warning (optional)
     try:
         ser = edited["serial_no"].astype(str).str.strip()
         ser = ser[ser != ""]
@@ -1098,7 +1108,6 @@ def view_inventory():
     except Exception:
         pass
 
-    # Missing required fields warning
     try:
         missing_mask = (edited["sku"].astype(str).str.strip() == "") | (edited["name"].astype(str).str.strip() == "")
         wont_save = int(missing_mask.sum())
@@ -1110,7 +1119,6 @@ def view_inventory():
     block_on_dup = st.checkbox("Block save on duplicates (Serial #)", value=False, help="If enabled, Save will abort when duplicate Serial # values are present (ignores blanks).")
 
     if add_cols[3].button("💾 Save (Upsert / Rename / Delete removed)"):
-        # block if requested and duplicates present
         try:
             ser = edited["serial_no"].astype(str).str.strip()
             ser = ser[ser != ""]
