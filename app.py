@@ -1,14 +1,12 @@
 # app.py — OpperWorks Stock Take (Streamlit)
-# Updates in this version:
-# - Serial Number persistence end-to-end:
-#     • One-time SQLite migration to add items.serial_no (safe/no-op if already present)
-#     • UI grid reads/writes serial_no
-#     • PDFs & restore already handle serial_no
-# - “Add-as-you-go” grid kept; Save now validates rows and warns if any are missing SKU/Name
-# - Maintenance page: one-click “Repair DB: add Serial Number column” action
-# - Auto-sort after save remains Category → SKU → Name
-#
-# Note: Migration is best-effort and safe. If your DB module path is custom, the Maintenance button lets you retry.
+# === What’s new in this build ===
+# • Serial Number now sticks after Save:
+#     - Tries to patch SQLite schema to add items.serial_no (safe/no-op).
+#     - ALSO adds a compatibility fallback using a Settings-backed map so serials persist
+#       even if your db.py doesn’t store the column yet.
+#     - Rename/Delete keeps serials in sync.
+#     - Snapshots/Auto-backup include serials.
+# • Inventory grid keeps “add-as-you-go”, supports renaming SKU, and warns on rows missing SKU/Name.
 
 import os, json, re, io, zipfile, glob, math, shutil, sqlite3
 import datetime as dt
@@ -151,7 +149,7 @@ email_recipients = get_setting("email_recipients", "")
 auto_backup_enabled = str(get_setting("auto_backup_enabled", "true")).lower() in {"1","true","yes","on"}
 brand_rgb = hex_to_rgb(brand_color)
 
-# ---------- Schema migration helpers (safe/no-op) ----------
+# ---------- Serial Number: schema + compatibility layer ----------
 def _db_candidates_from_module():
     """Try to locate the sqlite file used by db.py. Best-effort."""
     paths = []
@@ -163,10 +161,8 @@ def _db_candidates_from_module():
                 paths.append(_coerce_path(p))
     except Exception:
         pass
-    # common fallbacks next to app
-    for name in ("data.db", "db.sqlite3", "app.db", "stock.db"):
+    for name in ("data.db", "db.sqlite3", "app.db", "stock.db", "inventory.db", "omec.db"):
         paths.append(os.path.join(ROOT, name))
-    # unique-ify while keeping order
     uniq = []
     for p in paths:
         if p and p not in uniq:
@@ -174,20 +170,15 @@ def _db_candidates_from_module():
     return [p for p in uniq if os.path.exists(p)]
 
 def _ensure_serialno_column(show_toast=False) -> bool:
-    """
-    Add items.serial_no TEXT if missing. Returns True if column exists (now or already).
-    Never raises (quietly returns False if we can't patch).
-    """
+    """Add items.serial_no TEXT if missing. Safe/no-op; returns True if present."""
+    # quick check: does get_items() already return serial_no?
     try:
-        # quick check via data
-        items = get_items()
-        if items and isinstance(items, list) and "serial_no" in items[0]:
+        sample = get_items() or []
+        if sample and "serial_no" in sample[0]:
             return True
     except Exception:
         pass
-
-    candidates = _db_candidates_from_module()
-    for path in candidates:
+    for path in _db_candidates_from_module():
         try:
             with sqlite3.connect(path) as con:
                 cur = con.cursor()
@@ -195,31 +186,61 @@ def _ensure_serialno_column(show_toast=False) -> bool:
                 cols = [r[1] for r in cur.fetchall()]
                 if "serial_no" in cols:
                     return True
-                # add column
                 cur.execute("ALTER TABLE items ADD COLUMN serial_no TEXT")
                 con.commit()
-                if show_toast:
-                    st.toast("DB patched: added items.serial_no", icon="✅")
+                if show_toast: st.toast("DB patched: added items.serial_no", icon="✅")
                 return True
         except Exception:
             continue
-    # Last resort: try creating a dummy upsert (in case db.add_or_update_item handles dynamic columns)
-    try:
-        add_or_update_item({
-            "sku": "_schema_probe_ignore_",
-            "name": "_probe_",
-            "serial_no": "",
-            "quantity": 0.0, "min_qty": 0.0, "unit_cost": 0.0
-        })
-        delete_item("_schema_probe_ignore_")
-        return True
-    except Exception:
-        pass
     if show_toast:
-        st.toast("Could not auto-add items.serial_no (you can retry from Maintenance).", icon="⚠️")
+        st.toast("Could not auto-add items.serial_no (compat fallback will be used).", icon="⚠️")
     return False
 
-# Run once on app start (safe)
+# Settings-backed fallback map (works even if db.py ignores serial_no)
+def _load_serial_map() -> dict:
+    try:
+        raw = get_setting("serial_map", "{}") or "{}"
+        m = json.loads(raw)
+        return m if isinstance(m, dict) else {}
+    except Exception:
+        return {}
+
+def _save_serial_map(m: dict):
+    try:
+        upsert_setting("serial_map", json.dumps(m, ensure_ascii=False))
+    except Exception:
+        pass
+
+def _overlay_serials(items: list[dict]) -> list[dict]:
+    """Overlay serial_no from settings map where DB doesn't supply one."""
+    m = _load_serial_map()
+    out = []
+    for it in items:
+        it = dict(it)
+        if (not it.get("serial_no")) and it.get("sku") in m:
+            it["serial_no"] = m[it["sku"]]
+        out.append(it)
+    return out
+
+def get_items_with_serial() -> list[dict]:
+    return _overlay_serials(get_items())
+
+def _set_or_clear_serial_in_map(sku: str, serial: str | None):
+    m = _load_serial_map()
+    if sku and (serial or "").strip():
+        m[sku] = serial.strip()
+    else:
+        m.pop(sku, None)
+    _save_serial_map(m)
+
+def _rename_serial_in_map(old_sku: str, new_sku: str):
+    if not old_sku or not new_sku or old_sku == new_sku: return
+    m = _load_serial_map()
+    if old_sku in m:
+        m[new_sku] = m.pop(old_sku)
+        _save_serial_map(m)
+
+# Run once on app start (safe). Even if this fails, fallback map will persist serials.
 _ensure_serialno_column(show_toast=False)
 
 # Try auto-detect bundled logos on first run
@@ -321,7 +342,8 @@ def _has_snapshot_for_today():
 
 if auto_backup_enabled and not _has_snapshot_for_today():
     try:
-        items = get_items()
+        # include serial overlay in backups
+        items = get_items_with_serial()
         tx = get_transactions(limit=1_000_000)
         path = export_snapshot(items, tx, tag=f"Auto_{dt.date.today().isoformat()}", note="Auto-backup on app open")
         path = _move_to_snap_dir(path, SNAP_DIR)
@@ -900,7 +922,7 @@ def view_dashboard():
     st.title("🏠 Dashboard")
     st.caption("Quick overview + low-stock email helper.")
 
-    items = get_items()
+    items = get_items_with_serial()
     df = pd.DataFrame(items)
     if "category" in df.columns:
         df["category"] = df["category"].apply(normalize_category)
@@ -964,18 +986,16 @@ def view_inventory():
     st.caption("Add as you go: insert blank rows below, type, and **Save**. Deleting rows removes them; editing SKU renames.")
     _ensure_serialno_column(show_toast=False)
 
-    # Initialize session state for new blank rows
     if "inv_new_rows" not in st.session_state:
         st.session_state.inv_new_rows = 0
 
-    items = get_items()
+    items = get_items_with_serial()
     df = pd.DataFrame(items)
     if "category" in df.columns:
         df["category"] = df["category"].apply(normalize_category)
 
     filt = st.text_input("Filter (SKU/Serial/Name/Category/Location contains…)")
     fdf = df.copy()
-    # Ensure columns exist
     for col in ["sku","serial_no","name","category","location","unit","quantity","min_qty","unit_cost","convert_to","convert_factor","notes","updated_at"]:
         if col not in fdf.columns:
             fdf[col] = None
@@ -991,24 +1011,19 @@ def view_inventory():
         )
         fdf = fdf[mask]
 
-    # Auto-sort view Category → SKU → Name
     sort_keys = [k for k in ["category","sku","name"] if k in fdf.columns]
     if sort_keys:
         fdf = fdf.sort_values(by=sort_keys, kind="stable", na_position="last").reset_index(drop=True)
 
     st.subheader("Inventory List (editable)")
-
-    # Track original SKU for rename/delete detection
     fdf = fdf.copy()
     fdf["_orig_sku"] = fdf["sku"].astype(str)
 
-    # Add blank rows helper UI
     add_cols = st.columns([1,1,6,2])
     add_n = add_cols[0].number_input("Add rows", min_value=1, max_value=50, value=1, step=1)
     if add_cols[1].button("➕ Add blank row(s)"):
         st.session_state.inv_new_rows += int(add_n)
 
-    # Build DataFrame with extra blank rows (not yet committed)
     def _blank_row_dict():
         return {
             "sku": "", "serial_no": "", "name": "", "category": "", "location": "", "unit": "",
@@ -1021,7 +1036,6 @@ def view_inventory():
         blanks = pd.DataFrame([_blank_row_dict() for _ in range(st.session_state.inv_new_rows)])
         fdf = pd.concat([fdf, blanks], ignore_index=True)
 
-    # Editor config
     column_config = {
         "sku": st.column_config.TextColumn("SKU", help="Required"),
         "serial_no": st.column_config.TextColumn("Serial Number"),
@@ -1051,7 +1065,6 @@ def view_inventory():
         column_config=column_config
     )
 
-    # Validation hint (rows that won't be saved)
     try:
         missing_mask = (edited["sku"].astype(str).str.strip() == "") | (edited["name"].astype(str).str.strip() == "")
         wont_save = int(missing_mask.sum())
@@ -1060,15 +1073,10 @@ def view_inventory():
     except Exception:
         pass
 
-    # SAVE
     if add_cols[3].button("💾 Save (Upsert / Rename / Delete removed)"):
-        # Sets for deletion detection (original items only)
         original_skus = set(df["sku"].astype(str).tolist()) if not df.empty else set()
-
-        # Normalize NaNs
         edited = edited.fillna({"sku":"", "name":"", "_orig_sku":"", "serial_no":""})
 
-        # Upsert & rename
         upserts = 0
         renames = 0
         creates = 0
@@ -1079,11 +1087,8 @@ def view_inventory():
             orig_sku = (r.get("_orig_sku") or "").strip()
             name = (r.get("name") or "").strip()
 
-            # Skip empty placeholder rows
             if new_sku == "" and name == "":
                 continue
-
-            # Require SKU & Name for persistence
             if not new_sku or not name:
                 continue
 
@@ -1107,6 +1112,7 @@ def view_inventory():
                 continue
             seen_targets.add(new_sku)
 
+            # Upsert via db.py
             if orig_sku and new_sku != orig_sku and orig_sku in original_skus:
                 try:
                     delete_item(orig_sku)
@@ -1114,6 +1120,7 @@ def view_inventory():
                     pass
                 add_or_update_item(payload)
                 renames += 1
+                _rename_serial_in_map(orig_sku, new_sku)
             else:
                 if new_sku not in original_skus:
                     creates += 1
@@ -1121,7 +1128,9 @@ def view_inventory():
                     upserts += 1
                 add_or_update_item(payload)
 
-        # Deletions: any original SKUs not present in edited rows' _orig_sku
+            # Ensure serial persists via fallback map
+            _set_or_clear_serial_in_map(new_sku, payload.get("serial_no"))
+
         kept_orig_skus = set(edited["_orig_sku"].astype(str).tolist()) if "_orig_sku" in edited.columns else set()
         deleted_skus = list(original_skus - kept_orig_skus)
         deletions = 0
@@ -1131,8 +1140,8 @@ def view_inventory():
                 deletions += 1
             except Exception:
                 pass
+            _set_or_clear_serial_in_map(sku_del, None)
 
-        # Reset added blanks cache and refresh
         st.session_state.inv_new_rows = 0
         st.success(f"Saved: {creates} new | {upserts} updates | {renames} renames | {deletions} deletions.")
         st.rerun()
@@ -1143,6 +1152,7 @@ def view_inventory():
     if colB.button("Delete Item"):
         if to_delete:
             delete_item(to_delete.strip())
+            _set_or_clear_serial_in_map(to_delete.strip(), None)
             st.success(f"Deleted '{to_delete}'")
             st.rerun()
         else:
@@ -1152,7 +1162,7 @@ def view_transactions():
     st.title("🔁 Transactions")
     st.caption("Record stock movement in/out and maintain an audit trail.")
 
-    items = get_items()
+    items = get_items_with_serial()
     sku_list = [i["sku"] for i in items]
 
     with st.form("tx_form"):
@@ -1217,7 +1227,7 @@ def view_issue_sheets():
         st.error("PDF engine not available. Add `fpdf2==2.7.9` to requirements.txt.")
         return
 
-    items = get_items()
+    items = get_items_with_serial()
     df = pd.DataFrame(items)
     if "category" in df.columns:
         df["category"] = df["category"].apply(normalize_category)
@@ -1315,7 +1325,7 @@ def view_versions():
     tag = st.text_input("Version tag (e.g., V0.1, 'after_stock_count')")
     note = st.text_area("Note")
     if st.button("Create Snapshot ZIP"):
-        items = get_items()
+        items = get_items_with_serial()  # include serials
         tx = get_transactions(limit=1_000_000)
         zip_path = export_snapshot(items, tx, tag=tag, note=note)
         zip_path = _move_to_snap_dir(zip_path, SNAP_DIR)
@@ -1329,7 +1339,7 @@ def view_versions():
     cols = st.columns(3)
     site = cols[0].text_input("Site name", value="Main Workshop")
     if cols[1].button("Create snapshot for site"):
-        items = get_items()
+        items = get_items_with_serial()
         tx = get_transactions(limit=1_000_000)
         site_tag = f"{site.replace(' ', '_')}_{timestamp()}"
         zip_path = export_snapshot(items, tx, tag=site_tag, note=f"Site: {site}")
@@ -1400,13 +1410,16 @@ def _restore_from_bytes(zip_bytes: bytes, replace_items: bool, append_tx: bool, 
                 delete_item(it["sku"])
             except Exception:
                 pass
+        # also clear serial map for safety
+        _save_serial_map({})
 
     added_items = 0
     for _, r in inv_df.iterrows():
         try:
+            serial_val = (str(r.get("serial_no")).strip() if "serial_no" in inv_df.columns and pd.notna(r.get("serial_no")) else None)
             add_or_update_item({
                 "sku": str(r.get("sku") or "").strip(),
-                "serial_no": (str(r.get("serial_no")).strip() if "serial_no" in inv_df.columns and pd.notna(r.get("serial_no")) else None),
+                "serial_no": serial_val,
                 "name": str(r.get("name") or "").strip(),
                 "category": normalize_category(r.get("category")),
                 "location": (r.get("location") if pd.notna(r.get("location")) else None),
@@ -1419,6 +1432,8 @@ def _restore_from_bytes(zip_bytes: bytes, replace_items: bool, append_tx: bool, 
                 "convert_factor": float(r.get("convert_factor") or 0) if "convert_factor" in inv_df.columns else 0.0,
                 "image_path": None,
             })
+            # ensure serial recorded in fallback map as well
+            _set_or_clear_serial_in_map(str(r.get("sku") or "").strip(), serial_val)
             added_items += 1
         except Exception as e:
             st.warning(f"Item restore skipped for SKU={r.get('sku')}: {e}")
@@ -1478,7 +1493,7 @@ def view_reports():
         return
 
     st.subheader("Inventory Report")
-    items = get_items()
+    items = get_items_with_serial()
     df_items = pd.DataFrame(items)
     if "category" in df_items.columns:
         df_items["category"] = df_items["category"].apply(normalize_category)
@@ -1609,7 +1624,7 @@ def view_maintenance():
     st.title("🛠️ Maintenance")
     st.caption("Maintenance usage + Category Manager / cleanup tools.")
 
-    items = get_items()
+    items = get_items_with_serial()
     if not items:
         st.info("Add items first in the Inventory page.")
     else:
@@ -1634,7 +1649,7 @@ def view_maintenance():
 
     st.divider()
     st.subheader("Category Manager")
-    df_all = pd.DataFrame(get_items())
+    df_all = pd.DataFrame(get_items_with_serial())
     if "category" in df_all.columns:
         df_all["category"] = df_all["category"].apply(normalize_category)
     distinct = sorted([c for c in df_all.get("category", pd.Series(dtype=str)).dropna().unique().tolist()])
@@ -1648,7 +1663,7 @@ def view_maintenance():
         else:
             target = normalize_category(new_cat)
             count = 0
-            items = get_items()
+            items = get_items_with_serial()
             for it in items:
                 cur = normalize_category(it.get("category"))
                 if cur == old_cat:
@@ -1658,7 +1673,7 @@ def view_maintenance():
             st.success(f"Updated {count} item(s) from '{old_cat}' → '{target}'.")
             st.rerun()
     if c4.button("Normalize categories (trim/collapse Title-Case)"):
-        items = get_items()
+        items = get_items_with_serial()
         fixed = 0
         for it in items:
             cur = it.get("category")
