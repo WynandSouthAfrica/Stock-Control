@@ -1,10 +1,10 @@
 # app.py — OpperWorks Stock Take (Streamlit)
-# === What’s new in this build ===
-# - Sidebar header now shows your OpperWorks logo at the very top (replaces the old “OMEC” text).
-# - Auto-detects the bundled logo “/mnt/data/OpperWorks Logo.png” on first run and saves it.
-# - Branding panel adds a “Use OpperWorks logo” quick button.
-# - All previous features preserved: Serial # column, add-as-you-go rows, rename/delete on save,
-#   PDF wrapping for Name/Notes, Rand formatting, snapshots, etc.
+# === This build ===
+# - Fix: sidebar header now renders the OpperWorks logo reliably (no TypeError).
+# - Replace “OMEC” text header with your OpperWorks logo top-left.
+# - Branding panel still supports uploading a custom logo + “Use OpperWorks logo” quick action.
+# - Duplicate check switched from Serial # → SKU (warning + optional block on Save).
+# - Keep: Serial Number column; “Find by Serial #”; add-as-you-go rows; rename SKU by editing; PDF name/notes wrapping; Rand formatting; snapshots.
 
 import os, json, re, io, zipfile, glob, math, shutil, sqlite3
 import datetime as dt
@@ -52,12 +52,11 @@ def _coerce_path(user_path: str) -> str:
 def _norm_path(p: str) -> str:
     return _coerce_path(p)
 
-def safe_show_logo(path: str, height: int | None = None):
-    """Best-effort image render (sidebar)."""
+def safe_show_logo(path: str):
     try:
         apath = _norm_path(path)
         if apath and os.path.exists(apath):
-            st.sidebar.image(apath, use_container_width=(height is None), clamp=False, output_format="auto")
+            st.sidebar.image(apath, use_container_width=True)
     except Exception:
         pass
 
@@ -148,7 +147,7 @@ email_recipients = get_setting("email_recipients", "")
 auto_backup_enabled = str(get_setting("auto_backup_enabled", "true")).lower() in {"1","true","yes","on"}
 brand_rgb = hex_to_rgb(brand_color)
 
-# ---------- Serial Number: schema + compatibility layer ----------
+# ---------- Serial Number support (DB patch + compatibility map) ----------
 def _db_candidates_from_module():
     paths = []
     try:
@@ -236,7 +235,7 @@ def _rename_serial_in_map(old_sku: str, new_sku: str):
 
 _ensure_serialno_column(show_toast=False)
 
-# ---------- Auto-detect bundled OpperWorks logo on first run ----------
+# ---------- Auto-detect bundled OpperWorks logo (first run) ----------
 if not logo_path:
     try:
         candidates = [
@@ -260,15 +259,13 @@ if not logo_path:
     except Exception:
         pass
 
-# ---------- Sidebar brand header ----------
+# ---------- Sidebar brand header (logo replaces text header) ----------
 def render_brand_header():
-    """Show logo at the very top. Falls back to brand text if logo missing."""
     if logo_path and os.path.exists(_norm_path(logo_path)):
-        # Logo replaces the old text header
-        st.sidebar.image(_norm_path(logo_path), use_container_width=True)
+        safe_show_logo(logo_path)
     else:
         st.sidebar.markdown(
-            f"<h2 style='color:{brand_color}; margin: 0 0 6px 0'>{brand_name}</h2>",
+            f"<h2 style='color:{brand_color}; margin-bottom:0'>{brand_name}</h2>",
             unsafe_allow_html=True
         )
 
@@ -370,7 +367,7 @@ if auto_backup_enabled and not _has_snapshot_for_today():
     except Exception:
         st.sidebar.warning("Auto-backup attempt failed (non-blocking).")
 
-# ---------- PDF helpers/classes ----------
+# ---------- PDF utilities ----------
 if FPDF_AVAILABLE:
     class BrandedPDF(FPDF):
         def __init__(self, brand_name: str, brand_rgb: tuple, logo_path: str = "", revision_tag: str = "Rev0.1", *args, **kwargs):
@@ -609,7 +606,6 @@ def _inventory_pdf_bytes_grouped(
         if c in present:
             align_map[present.index(c)] = "R"
 
-    # Wrap Name and Notes in the PDF
     wrap_idx_set = set()
     if "Name" in display_cols:
         wrap_idx_set.add(display_cols.index("Name"))
@@ -712,7 +708,7 @@ def _inventory_pdf_bytes_grouped(
     data = pdf.output(dest="S")
     return bytes(data) if isinstance(data, (bytes, bytearray)) else str(data).encode("latin-1", errors="ignore")
 
-# ---------- Issue Sheet PDF (A4 Landscape) + Return Sheet ----------
+# ---------- Issue Sheet PDF (with Serial # column kept) ----------
 def _issue_sheet_pdf_bytes(
     df: pd.DataFrame,
     brand_name, brand_rgb, logo_path, revision_tag,
@@ -947,9 +943,7 @@ def _issue_sheet_pdf_bytes(
     data = pdf.output(dest="S")
     return bytes(data) if isinstance(data, (bytes, bytearray)) else str(data).encode("latin-1", errors="ignore")
 
-# ---------- Views (Dashboard / Inventory / Transactions / Versions / Reports / Maintenance)
-# ... (UNCHANGED logic below except that all calls to get_items() are replaced by get_items_with_serial())
-
+# ---------- Views ----------
 def view_dashboard():
     st.title("🏠 Dashboard")
     st.caption("Quick overview + low-stock email helper.")
@@ -1030,7 +1024,7 @@ def view_inventory():
         cA, cB, cC = st.columns([2,4,4])
         serial_find = cA.text_input("🔎 Find by Serial #", placeholder="Type full/part of serial…")
         filt = cB.text_input("Filter (SKU/Serial/Name/Category/Location contains…")
-        dup_warn_toggle = cC.toggle("Warn on duplicate serials", value=True, help="Shows a warning if the grid contains duplicate Serial # values (ignores blanks).")
+        sku_warn_toggle = cC.toggle("Warn on duplicate SKUs", value=True)
 
     fdf = df.copy()
     for col in ["sku","serial_no","name","category","location","unit","quantity","min_qty","unit_cost","convert_to","convert_factor","notes","updated_at"]:
@@ -1126,13 +1120,14 @@ def view_inventory():
         column_config=column_config
     )
 
+    # Duplicate SKU warning
     try:
-        ser = edited["serial_no"].astype(str).str.strip()
-        ser = ser[ser != ""]
-        dup_vals = ser[ser.duplicated(keep=False)]
-        if dup_warn_toggle and len(dup_vals) > 0:
+        skus = edited["sku"].astype(str).str.strip()
+        skus = skus[skus != ""]
+        dup_vals = skus[skus.duplicated(keep=False)]
+        if sku_warn_toggle and len(dup_vals) > 0:
             dups = sorted(set(dup_vals.tolist()))
-            st.warning(f"Duplicate Serial # detected in the grid: {', '.join(dups)}")
+            st.warning(f"Duplicate SKU detected in the grid: {', '.join(dups)}")
     except Exception:
         pass
 
@@ -1144,17 +1139,17 @@ def view_inventory():
     except Exception:
         pass
 
-    block_on_dup = st.checkbox("Block save on duplicates (Serial #)", value=False, help="If enabled, Save will abort when duplicate Serial # values are present (ignores blanks).")
+    block_on_dup = st.checkbox("Block save on duplicates (SKU)", value=False)
 
     if add_cols[3].button("💾 Save (Upsert / Rename / Delete removed)"):
         try:
-            ser = edited["serial_no"].astype(str).str.strip()
-            ser = ser[ser != ""]
-            has_dups = ser.duplicated().any()
+            skus = edited["sku"].astype(str).str.strip()
+            skus = skus[skus != ""]
+            has_dups = skus.duplicated().any()
         except Exception:
             has_dups = False
         if block_on_dup and has_dups:
-            st.error("Save blocked: duplicate Serial # values present. Resolve and try again.")
+            st.error("Save blocked: duplicate SKU values present. Resolve and try again.")
             return
 
         original_skus = set(df["sku"].astype(str).tolist()) if not df.empty else set()
