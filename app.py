@@ -1,8 +1,9 @@
 # app.py — OpperWorks Stock Take (Streamlit)
-# Update: Currency formatting for Rand (comma thousands, dot cents) everywhere costs/values are displayed.
-# - PDFs already used ,/. formatting; confirmed and standardized.
-# - Dashboard metrics & tables now show Rand with commas.
-# - No other behavior/layout changed. Quick Edit remains removed; Inventory editor remains taller.
+# Update: Added "Serial Number" column end-to-end.
+# - Inventory: form field, editor column, filter/search.
+# - PDFs: Inventory Report + Issue/Return sheets include "Serial #".
+# - Restore: loads serial_no from CSV if present.
+# - Non-breaking if empty; layout auto-sizes.
 
 import os, json, re, io, zipfile, glob, math, shutil
 import datetime as dt
@@ -92,7 +93,7 @@ def normalize_category(cat):
     s = re.sub(r"\s+", " ", s)
     return s.title()
 
-# ---- NEW: consistent Rand currency formatting ----
+# ---- Rand currency formatting ----
 def fmt_rands(x, with_symbol=True) -> str:
     """Return 'R 12,345.67' (or '12,345.67' if with_symbol=False) for numeric x."""
     try:
@@ -158,7 +159,6 @@ brand_rgb = hex_to_rgb(brand_color)
 # Try auto-detect bundled OpperWorks logo (preferred) or PG Bison logo on first run
 if not logo_path:
     try:
-        # Preferred: OpperWorks brand logo
         opp_src = "/mnt/data/Logo R0.1.png"
         if os.path.exists(opp_src):
             ext = os.path.splitext(opp_src)[1] or ".png"
@@ -168,7 +168,6 @@ if not logo_path:
             upsert_setting("logo_path", dst)
             logo_path = dst
         else:
-            # Fallback: PG Bison logo
             pg_bison_src = "/mnt/data/PG Bison.jpg"
             if os.path.exists(pg_bison_src):
                 dst = os.path.join(ASSETS_DIR, "brand_logo.jpg")
@@ -441,7 +440,7 @@ def _inventory_pdf_bytes_grouped(
         df = df.sort_values(by=[sort_by, "sku", "name"], kind="stable")
 
     key_cols = [
-        "sku", "name", "category", "location", "unit",
+        "sku", "serial_no", "name", "category", "location", "unit",
         "quantity", "min_qty", "unit_cost", "value",
         "convert_to", "converted_qty", "notes", "updated_at"
     ]
@@ -451,7 +450,7 @@ def _inventory_pdf_bytes_grouped(
     df = df[present]
 
     col_names = {
-        "sku": "SKU", "name": "Name", "category": "Category", "location": "Location",
+        "sku": "SKU", "serial_no": "Serial #", "name": "Name", "category": "Category", "location": "Location",
         "unit": "Unit", "quantity": "Qty", "min_qty": "Min",
         "unit_cost": "Unit Cost (R)", "value": "Value (R)",
         "convert_to": "Conv Unit", "converted_qty": "Conv Qty",
@@ -465,7 +464,7 @@ def _inventory_pdf_bytes_grouped(
     for _, r in df.iterrows():
         row = {}
         for c in present:
-            v = r[c]
+            v = r[c] if c in r else None
             if c in ("quantity", "min_qty"):
                 v = fmt_num(float(v), 2)
             elif c in ("unit_cost", "value"):
@@ -537,15 +536,15 @@ def _inventory_pdf_bytes_grouped(
         pdf.set_text_color(30, 30, 30)
         pdf.cell(sum(widths), span_h, to_latin1(f"Category: {cat}"), border=1, ln=1, fill=True)
 
-        cat_qty = float(block["quantity"].sum())
-        cat_value = float((block["quantity"] * block["unit_cost"]).sum())
+        cat_qty = float(block["quantity"].sum() if "quantity" in block.columns else 0.0)
+        cat_value = float((block["quantity"] * block["unit_cost"]).sum() if {"quantity","unit_cost"}.issubset(block.columns) else 0.0)
         grand_qty += cat_qty
         grand_value += cat_value
 
         for _, r in block.iterrows():
             vals = []
             for c in present:
-                v = r[c]
+                v = r[c] if c in r else None
                 if c in ("quantity", "min_qty"):
                     v = f"{float(v):,.2f}"
                 elif c in ("unit_cost", "value"):
@@ -553,7 +552,12 @@ def _inventory_pdf_bytes_grouped(
                 elif c == "converted_qty" and pd.notna(v):
                     v = f"{float(v):,.3f}"
                 vals.append(v if v is not None else "")
-            fill = low_stock_fill if float(r["quantity"]) < float(r["min_qty"]) else None
+            fill = None
+            try:
+                if float(r.get("quantity", 0)) < float(r.get("min_qty", 0)):
+                    fill = low_stock_fill
+            except Exception:
+                pass
             _ensure_page_space(pdf, 9, display_cols, widths, 9, brand_rgb)
             _draw_row(pdf, vals, widths, 7, align_map=align_map, fill_rgb=fill, wrap_idx_set=wrap_idx_set)
 
@@ -624,14 +628,15 @@ def _issue_sheet_pdf_bytes(
     if only_available:
         df = df[df["quantity"] > 0]
 
-    present = ["sku","name","unit","quantity","min_qty"]
-    col_map = {"sku":"SKU","name":"Item","unit":"Unit","quantity":"On-hand","min_qty":"Min"}
-    display_cols = [col_map[c] for c in present] + ["Qty Issued", "To (Person)", "Signature", "Date"]
+    present = ["sku","serial_no","name","unit","quantity","min_qty"]
+    col_map = {"sku":"SKU","serial_no":"Serial #","name":"Item","unit":"Unit","quantity":"On-hand","min_qty":"Min"}
+    display_cols = [col_map[c] for c in present if c in df.columns or c in ("sku","name","unit","quantity","min_qty","serial_no")] + ["Qty Issued", "To (Person)", "Signature", "Date"]
 
     rows_for_width = []
     for _, r in df.iterrows():
         rows_for_width.append({
             "SKU": str(r.get("sku","")),
+            "Serial #": str(r.get("serial_no","") or ""),
             "Item": str(r.get("name","")),
             "Unit": str(r.get("unit","") or ""),
             "On-hand": f"{float(r.get('quantity') or 0):,.2f}",
@@ -681,6 +686,7 @@ def _issue_sheet_pdf_bytes(
     # widen key columns a bit for handwriting, then re-fit to page
     for i, name in enumerate(display_cols):
         if name in {"Item"}:                 widths[i] = max(widths[i], 80)
+        if name in {"Serial #"}:             widths[i] = max(widths[i], 35)
         if name in {"Qty Issued"}:           widths[i] = max(widths[i], 26)
         if name in {"To (Person)"}:          widths[i] = max(widths[i], 45)
         if name in {"Signature"}:            widths[i] = max(widths[i], 38)
@@ -688,7 +694,9 @@ def _issue_sheet_pdf_bytes(
     widths = _fit_widths(widths, page_w)
 
     _draw_header_row(pdf, display_cols, widths, 9, brand_rgb)
-    align_map = {display_cols.index("On-hand"): "R", display_cols.index("Min"): "R"}
+    align_map = {}
+    if "On-hand" in display_cols: align_map[display_cols.index("On-hand")] = "R"
+    if "Min" in display_cols:     align_map[display_cols.index("Min")]     = "R"
     cat_bar = lighten(brand_rgb, 0.80)
 
     if "category" in df.columns:
@@ -717,25 +725,28 @@ def _issue_sheet_pdf_bytes(
             onhand = float(r.get("quantity") or 0.0)
             minq   = float(r.get("min_qty") or 0.0)
 
-            values = [
-                r.get("sku",""),
-                r.get("name",""),
-                r.get("unit","") or "",
-                f"{onhand:,.2f}",
-                f"{minq:,.2f}",
-                "", "", "", ""
-            ]
+            values_map = {
+                "SKU": r.get("sku",""),
+                "Serial #": r.get("serial_no","") or "",
+                "Item": r.get("name",""),
+                "Unit": r.get("unit","") or "",
+                "On-hand": f"{onhand:,.2f}",
+                "Min": f"{minq:,.2f}",
+                "Qty Issued": "",
+                "To (Person)": "",
+                "Signature": "",
+                "Date": ""
+            }
+            values = [values_map[col] for col in display_cols]
             _ensure_page_space(pdf, 8, display_cols, widths, 9, brand_rgb)
             _draw_row(pdf, values, widths, 7, align_map=align_map, border="1", wrap_idx_set=set())
 
-            if (fixed_blanks is not None) and (fixed_blanks > 0):
-                blanks = fixed_blanks
-            else:
-                blanks = min(max(0, int(math.floor(onhand))) + 1, max(1, int(blanks_cap)))
-
+            blanks = (fixed_blanks if (fixed_blanks is not None and fixed_blanks > 0)
+                      else min(max(0, int(math.floor(onhand))) + 1, max(1, int(blanks_cap))))
             per_item_blanks.append({
                 "cat": cat,
                 "sku": r.get("sku",""),
+                "serial_no": r.get("serial_no","") or "",
                 "name": r.get("name",""),
                 "unit": r.get("unit","") or "",
                 "blanks": blanks
@@ -759,13 +770,14 @@ def _issue_sheet_pdf_bytes(
         pdf.cell(0, 6, to_latin1(" | ".join(meta2)), ln=1)
         pdf.ln(2)
 
-        ret_cols = ["SKU","Item","Unit","Qty Returned","From (Person)","Signature","Date","Condition / Notes"]
-        ret_rows_for_width = [{"SKU":"","Item":"","Unit":"","Qty Returned":"","From (Person)":"","Signature":"","Date":"","Condition / Notes":""}]
+        ret_cols = ["SKU","Serial #","Item","Unit","Qty Returned","From (Person)","Signature","Date","Condition / Notes"]
+        ret_rows_for_width = [{k:"" for k in ret_cols}]
         page_w = pdf.w - pdf.l_margin - pdf.r_margin
         ret_widths = _compute_col_widths(pdf, ret_cols, ret_rows_for_width, page_w, font_size=9)
 
         for i, name in enumerate(ret_cols):
             if name in {"Item"}:                   ret_widths[i] = max(ret_widths[i], 90)
+            if name in {"Serial #"}:               ret_widths[i] = max(ret_widths[i], 35)
             if name in {"Qty Returned"}:           ret_widths[i] = max(ret_widths[i], 30)
             if name in {"From (Person)"}:          ret_widths[i] = max(ret_widths[i], 50)
             if name in {"Signature"}:              ret_widths[i] = max(ret_widths[i], 40)
@@ -792,7 +804,18 @@ def _issue_sheet_pdf_bytes(
 
             pdf.set_font("Helvetica", "", 9)
             for it in items_cat:
-                desc_vals = [it["sku"], it["name"], it["unit"], "", "", "", "", ""]
+                desc_vals_map = {
+                    "SKU": it["sku"],
+                    "Serial #": it.get("serial_no","") or "",
+                    "Item": it["name"],
+                    "Unit": it["unit"],
+                    "Qty Returned": "",
+                    "From (Person)": "",
+                    "Signature": "",
+                    "Date": "",
+                    "Condition / Notes": ""
+                }
+                desc_vals = [desc_vals_map[c] for c in ret_cols]
                 _ensure_page_space(pdf, 8, ret_cols, ret_widths, 9, brand_rgb)
                 _draw_row(pdf, desc_vals, ret_widths, 7, border="1", wrap_idx_set=set())
 
@@ -837,7 +860,6 @@ def view_dashboard():
     col1.metric("Distinct SKUs", total_items)
     col2.metric("Total Quantity", f"{total_qty:,.2f}")
     col3.metric("Low-Stock Items", low_stock)
-    # Currency with commas + dot cents
     col4.metric("Stock Value", fmt_rands(total_value))
 
     c1, c2 = st.columns(2)
@@ -851,7 +873,7 @@ def view_dashboard():
                 st.success("Nothing low on stock 🎉")
             else:
                 st.dataframe(
-                    low_df[["sku", "name", "category", "location", "quantity", "min_qty"]],
+                    low_df[["sku", "serial_no", "name", "category", "location", "quantity", "min_qty"]].fillna(""),
                     use_container_width=True, height=260
                 )
 
@@ -863,7 +885,6 @@ def view_dashboard():
             qty = df.groupby(df["category"].fillna("(Unspecified)"))["quantity"].sum().rename("qty")
             val = (df["quantity"] * df["unit_cost"]).groupby(df["category"].fillna("(Unspecified)")).sum().rename("value")
             cg = pd.concat([qty, val], axis=1)
-            # Style value as Rand currency with commas
             styler = cg.style.format({"qty": "{:,.2f}".format, "value": lambda v: fmt_rands(v)})
             st.dataframe(styler, use_container_width=True, height=260)
 
@@ -895,12 +916,15 @@ def view_inventory():
     if "category" in df.columns:
         df["category"] = df["category"].apply(normalize_category)
 
-    filt = st.text_input("Filter (SKU/Name/Category/Location contains…)")
+    filt = st.text_input("Filter (SKU/Serial/Name/Category/Location contains…)")
     fdf = df.copy()
     if filt:
         f = filt.lower()
+        for col in ["sku","serial_no","name","category","location"]:
+            if col not in fdf.columns: fdf[col] = ""
         mask = (
             fdf["sku"].astype(str).str.lower().str.contains(f) |
+            fdf["serial_no"].astype(str).str.lower().str.contains(f) |
             fdf["name"].astype(str).str.lower().str.contains(f) |
             fdf["category"].astype(str).str.lower().str.contains(f) |
             fdf["location"].astype(str).str.lower().str.contains(f)
@@ -916,11 +940,12 @@ def view_inventory():
         fdf = fdf.sort_values(by=sort_keys, kind="stable", na_position="last").reset_index(drop=True)
 
     with st.form("add_item"):
-        cols = st.columns(4)
+        cols = st.columns(5)
         sku = cols[0].text_input("SKU *")
-        name = cols[1].text_input("Name *")
-        category = cols[2].text_input("Category")
-        location = cols[3].text_input("Location")
+        serial_no = cols[1].text_input("Serial Number")
+        name = cols[2].text_input("Name *")
+        category = cols[3].text_input("Category")
+        location = cols[4].text_input("Location")
 
         cols2 = st.columns(5)
         unit = cols2[0].text_input("Unit (e.g., pcs, m, kg)")
@@ -938,6 +963,7 @@ def view_inventory():
             if sku and name:
                 add_or_update_item({
                     "sku": sku.strip(),
+                    "serial_no": serial_no.strip() if serial_no else None,
                     "name": name.strip(),
                     "category": normalize_category(category),
                     "location": location.strip() if location else None,
@@ -957,7 +983,10 @@ def view_inventory():
 
     st.subheader("Inventory List (editable)")
     if not fdf.empty:
-        show_cols = ["sku","name","category","location","unit","quantity","min_qty","unit_cost",
+        for col in ["serial_no","convert_to","convert_factor","notes","updated_at"]:
+            if col not in fdf.columns:
+                fdf[col] = None
+        show_cols = ["sku","serial_no","name","category","location","unit","quantity","min_qty","unit_cost",
                      "convert_to","convert_factor","notes","updated_at"]
         show_cols = [c for c in show_cols if c in fdf.columns]
         edited = st.data_editor(
@@ -965,11 +994,11 @@ def view_inventory():
             use_container_width=True,
             num_rows="dynamic",
             key="inv_editor",
-            height=900,  # expanded editor window
+            height=900,
             column_config={
+                "serial_no": st.column_config.TextColumn("Serial Number"),
                 "quantity": st.column_config.NumberColumn(format="%.3f"),
                 "min_qty": st.column_config.NumberColumn(format="%.3f"),
-                # Streamlit NumberColumn doesn't support thousand separators; keep input clean here
                 "unit_cost": st.column_config.NumberColumn(format="%.2f"),
                 "convert_factor": st.column_config.NumberColumn(format="%.3f"),
             }
@@ -978,6 +1007,7 @@ def view_inventory():
             for _, r in edited.iterrows():
                 add_or_update_item({
                     "sku": r.get("sku"),
+                    "serial_no": (r.get("serial_no") or None),
                     "name": r.get("name"),
                     "category": normalize_category(r.get("category")),
                     "location": r.get("location"),
@@ -1056,6 +1086,8 @@ def view_transactions():
         f = f[f["reason"].isin(reason_filter)]
     if search:
         s = search.lower()
+        for col in ["sku","project","reference","user","notes"]:
+            if col not in f.columns: f[col] = ""
         f = f[
             f["sku"].astype(str).str.lower().str.contains(s) |
             f["project"].astype(str).str.lower().str.contains(s) |
@@ -1262,6 +1294,7 @@ def _restore_from_bytes(zip_bytes: bytes, replace_items: bool, append_tx: bool, 
         try:
             add_or_update_item({
                 "sku": str(r.get("sku") or "").strip(),
+                "serial_no": (str(r.get("serial_no")).strip() if "serial_no" in inv_df.columns and pd.notna(r.get("serial_no")) else None),
                 "name": str(r.get("name") or "").strip(),
                 "category": normalize_category(r.get("category")),
                 "location": (r.get("location") if pd.notna(r.get("location")) else None),
