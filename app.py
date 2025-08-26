@@ -1,9 +1,8 @@
 # app.py — OpperWorks Stock Take (Streamlit)
-# Update: Added "Serial Number" column end-to-end.
-# - Inventory: form field, editor column, filter/search.
-# - PDFs: Inventory Report + Issue/Return sheets include "Serial #".
-# - Restore: loads serial_no from CSV if present.
-# - Non-breaking if empty; layout auto-sizes.
+# Updates:
+# - Row deletes from the grid: removing a row in the editor now deletes that SKU from the DB on Save.
+# - SKU rename in-place: editing the SKU will rename (delete old SKU, upsert new) on Save.
+# - Serial Number column supported across app and PDFs.
 
 import os, json, re, io, zipfile, glob, math, shutil
 import datetime as dt
@@ -156,7 +155,7 @@ email_recipients = get_setting("email_recipients", "")
 auto_backup_enabled = str(get_setting("auto_backup_enabled", "true")).lower() in {"1","true","yes","on"}
 brand_rgb = hex_to_rgb(brand_color)
 
-# Try auto-detect bundled OpperWorks logo (preferred) or PG Bison logo on first run
+# Try auto-detect bundled OpperWorks or PG Bison logo on first run
 if not logo_path:
     try:
         opp_src = "/mnt/data/Logo R0.1.png"
@@ -909,7 +908,7 @@ def view_dashboard():
 
 def view_inventory():
     st.title("📦 Inventory")
-    st.caption("Add, edit, or delete items. Edit directly in the list below and then **Save Edits** to upsert visible rows.")
+    st.caption("Edit directly below. **Deleting a row removes it from the DB on Save.** Editing the SKU will rename it.")
 
     items = get_items()
     df = pd.DataFrame(items)
@@ -983,32 +982,68 @@ def view_inventory():
 
     st.subheader("Inventory List (editable)")
     if not fdf.empty:
+        # Track original SKU to support rename & deletion detection
+        fdf = fdf.copy()
+        fdf["_orig_sku"] = fdf["sku"].astype(str)
+
         for col in ["serial_no","convert_to","convert_factor","notes","updated_at"]:
             if col not in fdf.columns:
                 fdf[col] = None
+
+        column_config = {
+            "sku": st.column_config.TextColumn("SKU"),
+            "serial_no": st.column_config.TextColumn("Serial Number"),
+            "name": st.column_config.TextColumn("Name"),
+            "category": st.column_config.TextColumn("Category"),
+            "location": st.column_config.TextColumn("Location"),
+            "unit": st.column_config.TextColumn("Unit"),
+            "quantity": st.column_config.NumberColumn(format="%.3f"),
+            "min_qty": st.column_config.NumberColumn(format="%.3f"),
+            "unit_cost": st.column_config.NumberColumn(format="%.2f"),
+            "convert_to": st.column_config.TextColumn("Convert To"),
+            "convert_factor": st.column_config.NumberColumn(format="%.3f"),
+            "notes": st.column_config.TextColumn("Notes"),
+            "updated_at": st.column_config.TextColumn("Updated"),
+            "_orig_sku": st.column_config.TextColumn("Original SKU", help="Used for renames; read-only", disabled=True, width="small"),
+        }
+
+        # Order with _orig_sku at the far right
         show_cols = ["sku","serial_no","name","category","location","unit","quantity","min_qty","unit_cost",
-                     "convert_to","convert_factor","notes","updated_at"]
+                     "convert_to","convert_factor","notes","updated_at","_orig_sku"]
         show_cols = [c for c in show_cols if c in fdf.columns]
+
         edited = st.data_editor(
             fdf[show_cols],
             use_container_width=True,
             num_rows="dynamic",
             key="inv_editor",
             height=900,
-            column_config={
-                "serial_no": st.column_config.TextColumn("Serial Number"),
-                "quantity": st.column_config.NumberColumn(format="%.3f"),
-                "min_qty": st.column_config.NumberColumn(format="%.3f"),
-                "unit_cost": st.column_config.NumberColumn(format="%.2f"),
-                "convert_factor": st.column_config.NumberColumn(format="%.3f"),
-            }
+            column_config=column_config
         )
-        if st.button("Save Edits (Upsert visible rows)"):
-            for _, r in edited.iterrows():
-                add_or_update_item({
-                    "sku": r.get("sku"),
+
+        # SAVE: upsert/rename for existing rows, delete rows removed from the grid
+        if st.button("Save Edits (Upsert / Rename / Delete removed rows)"):
+            # Sets for deletion detection
+            original_skus = set(fdf["_orig_sku"].astype(str).tolist())
+            remaining_rows = edited  # rows user kept (possibly with changed 'sku')
+            kept_orig_skus = set(remaining_rows["_orig_sku"].astype(str).tolist()) if "_orig_sku" in remaining_rows.columns else set()
+
+            # Upsert + handle rename
+            upserts = 0
+            renames = 0
+            for _, r in remaining_rows.iterrows():
+                new_sku = (r.get("sku") or "").strip()
+                orig_sku = (r.get("_orig_sku") or "").strip()
+                name = (r.get("name") or "").strip()
+
+                if not new_sku or not name:
+                    # Skip invalid rows
+                    continue
+
+                payload = {
+                    "sku": new_sku,
                     "serial_no": (r.get("serial_no") or None),
-                    "name": r.get("name"),
+                    "name": name,
                     "category": normalize_category(r.get("category")),
                     "location": r.get("location"),
                     "unit": r.get("unit"),
@@ -1019,8 +1054,31 @@ def view_inventory():
                     "convert_to": r.get("convert_to"),
                     "convert_factor": float(r.get("convert_factor") or 0),
                     "image_path": None,
-                })
-            st.success("Edits saved.")
+                }
+
+                if orig_sku and new_sku != orig_sku:
+                    # Rename: delete old key, then upsert new
+                    try:
+                        delete_item(orig_sku)
+                    except Exception:
+                        pass
+                    add_or_update_item(payload)
+                    renames += 1
+                else:
+                    add_or_update_item(payload)
+                    upserts += 1
+
+            # Deletions: any original rows not present now
+            deleted_skus = list(original_skus - kept_orig_skus)
+            deletions = 0
+            for sku_del in deleted_skus:
+                try:
+                    delete_item(sku_del)
+                    deletions += 1
+                except Exception:
+                    pass
+
+            st.success(f"Saved: {upserts} upserts | {renames} renames | {deletions} deletions.")
             st.rerun()
     else:
         st.info("No items yet. Add your first item above.")
