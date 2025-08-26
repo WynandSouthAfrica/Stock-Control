@@ -1,8 +1,8 @@
 # app.py — OpperWorks Stock Take (Streamlit)
 # Updates:
-# - Row deletes from the grid: removing a row in the editor now deletes that SKU from the DB on Save.
-# - SKU rename in-place: editing the SKU will rename (delete old SKU, upsert new) on Save.
-# - Serial Number column supported across app and PDFs.
+# - True “add-as-you-go” in the grid: add blank rows, type, and Save. Top add form removed.
+# - Keeps rename-on-Save (SKU edits), delete-on-Save (removed rows), and serial number support.
+# - Auto-sorts Category → SKU → Name on every reload after Save.
 
 import os, json, re, io, zipfile, glob, math, shutil
 import datetime as dt
@@ -33,25 +33,16 @@ ASSETS_DIR = os.path.join(ROOT, "assets")
 os.makedirs(ASSETS_DIR, exist_ok=True)
 
 def _coerce_path(user_path: str) -> str:
-    """
-    Make a user-supplied path usable on this OS.
-    On Windows: return absolute Windows path.
-    On POSIX: if it looks like C:\..., translate to /mnt/c/... (WSL/Docker-on-WSL).
-    Otherwise: absolute → as-is; relative → relative to app root.
-    """
     if not isinstance(user_path, str) or not user_path.strip():
         return ""
     p = user_path.strip()
-
     m = re.match(r"^([A-Za-z]):[\\/](.*)$", p)
     if m and os.name != "nt":
         drive = m.group(1).lower()
         rest = m.group(2).replace("\\", "/")
         return os.path.normpath(f"/mnt/{drive}/{rest}")
-
     if p.startswith("\\\\") and os.name != "nt":
         return p
-
     if os.path.isabs(p):
         return os.path.normpath(p)
     return os.path.normpath(os.path.join(ROOT, p))
@@ -94,7 +85,6 @@ def normalize_category(cat):
 
 # ---- Rand currency formatting ----
 def fmt_rands(x, with_symbol=True) -> str:
-    """Return 'R 12,345.67' (or '12,345.67' if with_symbol=False) for numeric x."""
     try:
         val = float(x)
     except Exception:
@@ -155,7 +145,7 @@ email_recipients = get_setting("email_recipients", "")
 auto_backup_enabled = str(get_setting("auto_backup_enabled", "true")).lower() in {"1","true","yes","on"}
 brand_rgb = hex_to_rgb(brand_color)
 
-# Try auto-detect bundled OpperWorks or PG Bison logo on first run
+# Try auto-detect bundled logos on first run
 if not logo_path:
     try:
         opp_src = "/mnt/data/Logo R0.1.png"
@@ -383,21 +373,17 @@ def _draw_row(pdf, values, widths, row_h, align_map=None, fill_rgb=None, bold=Fa
         align_map = {}
     if wrap_idx_set is None:
         wrap_idx_set = set()
-
     max_h = _calc_row_height_exact(pdf, values, widths, row_h, wrap_idx_set)
     pdf.set_font("Helvetica", "B" if bold else "", 9)
     if fill_rgb:
         pdf.set_fill_color(*fill_rgb)
     pdf.set_text_color(*text_rgb)
-
     y_start = pdf.get_y()
     x_left = pdf.get_x()
-
     for idx, (w, v) in enumerate(zip(widths, values)):
         x = pdf.get_x()
         align = align_map.get(idx, "L")
         txt = "" if v is None else str(v)
-
         if idx in wrap_idx_set:
             pdf.multi_cell(w, row_h, to_latin1(txt), border=border, align=align, new_x="RIGHT", new_y="TOP", fill=bool(fill_rgb))
             pdf.set_xy(x + w, y_start)
@@ -416,7 +402,6 @@ def _inventory_pdf_bytes_grouped(
     df = df.copy()
     if "category" in df.columns:
         df["category"] = df["category"].apply(normalize_category)
-
     df["quantity"] = pd.to_numeric(df.get("quantity"), errors="coerce").fillna(0.0)
     df["min_qty"] = pd.to_numeric(df.get("min_qty"), errors="coerce").fillna(0.0)
     df["unit_cost"] = pd.to_numeric(df.get("unit_cost"), errors="coerce").fillna(0.0)
@@ -646,7 +631,6 @@ def _issue_sheet_pdf_bytes(
             "Date": "",
         })
 
-    # A4 LANDSCAPE
     pdf = BrandedPDF(
         brand_name=brand_name, brand_rgb=brand_rgb, logo_path=logo_path, revision_tag=revision_tag,
         orientation="L", unit="mm", format="A4"
@@ -665,7 +649,6 @@ def _issue_sheet_pdf_bytes(
             x += w
         pdf.set_y(y + row_h)
 
-    # ---- Header / Meta
     pdf.set_font("Helvetica", "B", 15)
     pdf.cell(0, 9, to_latin1("Stock Issue Sheet"), ln=1)
     pdf.set_font("Helvetica", "", 10)
@@ -681,8 +664,6 @@ def _issue_sheet_pdf_bytes(
 
     page_w = pdf.w - pdf.l_margin - pdf.r_margin
     widths = _compute_col_widths(pdf, display_cols, rows_for_width, page_w, font_size=9)
-
-    # widen key columns a bit for handwriting, then re-fit to page
     for i, name in enumerate(display_cols):
         if name in {"Item"}:                 widths[i] = max(widths[i], 80)
         if name in {"Serial #"}:             widths[i] = max(widths[i], 35)
@@ -707,7 +688,6 @@ def _issue_sheet_pdf_bytes(
 
     per_item_blanks = []
 
-    # ---- Issue rows
     for cat in groups:
         block = df[df["category"].fillna("(Unspecified)") == cat]
         if block.empty:
@@ -723,7 +703,6 @@ def _issue_sheet_pdf_bytes(
         for _, r in block.iterrows():
             onhand = float(r.get("quantity") or 0.0)
             minq   = float(r.get("min_qty") or 0.0)
-
             values_map = {
                 "SKU": r.get("sku",""),
                 "Serial #": r.get("serial_no","") or "",
@@ -755,7 +734,6 @@ def _issue_sheet_pdf_bytes(
                 _ensure_page_space(pdf, 7, display_cols, widths, 9, brand_rgb)
                 draw_ruled_blank_row(pdf, widths, row_h=7, line_rgb=(170,170,170))
 
-    # ---- Return section (optional)
     if include_returns:
         pdf.add_page(orientation="L")
         pdf.set_font("Helvetica", "B", 15)
@@ -788,7 +766,7 @@ def _issue_sheet_pdf_bytes(
 
         cat_bar = lighten(brand_rgb, 0.80)
         groups2 = [x["cat"] for x in per_item_blanks]
-        groups2 = list(dict.fromkeys(groups2))  # preserve order/unique
+        groups2 = list(dict.fromkeys(groups2))
 
         for cat in groups2:
             items_cat = [x for x in per_item_blanks if x["cat"] == cat]
@@ -871,10 +849,8 @@ def view_dashboard():
             if low_df.empty:
                 st.success("Nothing low on stock 🎉")
             else:
-                st.dataframe(
-                    low_df[["sku", "serial_no", "name", "category", "location", "quantity", "min_qty"]].fillna(""),
-                    use_container_width=True, height=260
-                )
+                cols = [c for c in ["sku","serial_no","name","category","location","quantity","min_qty"] if c in low_df.columns]
+                st.dataframe(low_df[cols].fillna(""), use_container_width=True, height=260)
 
     with c2:
         st.subheader("Category totals")
@@ -908,7 +884,11 @@ def view_dashboard():
 
 def view_inventory():
     st.title("📦 Inventory")
-    st.caption("Edit directly below. **Deleting a row removes it from the DB on Save.** Editing the SKU will rename it.")
+    st.caption("Add as you go: insert blank rows below, type, and **Save**. Deleting rows removes them; editing SKU renames.")
+
+    # Initialize session state for new blank rows
+    if "inv_new_rows" not in st.session_state:
+        st.session_state.inv_new_rows = 0
 
     items = get_items()
     df = pd.DataFrame(items)
@@ -917,10 +897,13 @@ def view_inventory():
 
     filt = st.text_input("Filter (SKU/Serial/Name/Category/Location contains…)")
     fdf = df.copy()
+    # Ensure columns exist
+    for col in ["sku","serial_no","name","category","location","unit","quantity","min_qty","unit_cost","convert_to","convert_factor","notes","updated_at"]:
+        if col not in fdf.columns:
+            fdf[col] = None
+
     if filt:
         f = filt.lower()
-        for col in ["sku","serial_no","name","category","location"]:
-            if col not in fdf.columns: fdf[col] = ""
         mask = (
             fdf["sku"].astype(str).str.lower().str.contains(f) |
             fdf["serial_no"].astype(str).str.lower().str.contains(f) |
@@ -930,158 +913,144 @@ def view_inventory():
         )
         fdf = fdf[mask]
 
-    # Auto-sort by Category → SKU → Name
-    sort_keys = []
-    if "category" in fdf.columns: sort_keys.append("category")
-    if "sku" in fdf.columns:      sort_keys.append("sku")
-    if "name" in fdf.columns:     sort_keys.append("name")
+    # Auto-sort view Category → SKU → Name
+    sort_keys = [k for k in ["category","sku","name"] if k in fdf.columns]
     if sort_keys:
         fdf = fdf.sort_values(by=sort_keys, kind="stable", na_position="last").reset_index(drop=True)
 
-    with st.form("add_item"):
-        cols = st.columns(5)
-        sku = cols[0].text_input("SKU *")
-        serial_no = cols[1].text_input("Serial Number")
-        name = cols[2].text_input("Name *")
-        category = cols[3].text_input("Category")
-        location = cols[4].text_input("Location")
-
-        cols2 = st.columns(5)
-        unit = cols2[0].text_input("Unit (e.g., pcs, m, kg)")
-        quantity = cols2[1].number_input("Quantity", value=0.0, step=1.0, format="%.3f")
-        min_qty = cols2[2].number_input("Min Qty (alert level)", value=0.0, step=1.0, format="%.3f")
-        unit_cost = cols2[3].number_input("Unit Cost (R)", value=0.0, step=1.0, format="%.2f")
-        notes = cols2[4].text_input("Notes")
-
-        cols3 = st.columns(2)
-        convert_to = cols3[0].text_input("Convert to (optional, e.g., m², m)")
-        convert_factor = cols3[1].number_input("Conversion factor (base→convert)", value=0.0, step=0.001, format="%.3f")
-
-        submitted = st.form_submit_button("Save Item")
-        if submitted:
-            if sku and name:
-                add_or_update_item({
-                    "sku": sku.strip(),
-                    "serial_no": serial_no.strip() if serial_no else None,
-                    "name": name.strip(),
-                    "category": normalize_category(category),
-                    "location": location.strip() if location else None,
-                    "unit": unit.strip() if unit else None,
-                    "quantity": float(quantity),
-                    "min_qty": float(min_qty),
-                    "unit_cost": float(unit_cost),
-                    "notes": notes.strip() if notes else None,
-                    "convert_to": convert_to.strip() if convert_to else None,
-                    "convert_factor": float(convert_factor or 0.0),
-                    "image_path": None,
-                })
-                st.success(f"Saved item '{sku}'")
-                st.rerun()
-            else:
-                st.error("SKU and Name are required.")
-
     st.subheader("Inventory List (editable)")
-    if not fdf.empty:
-        # Track original SKU to support rename & deletion detection
-        fdf = fdf.copy()
-        fdf["_orig_sku"] = fdf["sku"].astype(str)
 
-        for col in ["serial_no","convert_to","convert_factor","notes","updated_at"]:
-            if col not in fdf.columns:
-                fdf[col] = None
+    # Track original SKU for rename/delete detection
+    fdf = fdf.copy()
+    fdf["_orig_sku"] = fdf["sku"].astype(str)
 
-        column_config = {
-            "sku": st.column_config.TextColumn("SKU"),
-            "serial_no": st.column_config.TextColumn("Serial Number"),
-            "name": st.column_config.TextColumn("Name"),
-            "category": st.column_config.TextColumn("Category"),
-            "location": st.column_config.TextColumn("Location"),
-            "unit": st.column_config.TextColumn("Unit"),
-            "quantity": st.column_config.NumberColumn(format="%.3f"),
-            "min_qty": st.column_config.NumberColumn(format="%.3f"),
-            "unit_cost": st.column_config.NumberColumn(format="%.2f"),
-            "convert_to": st.column_config.TextColumn("Convert To"),
-            "convert_factor": st.column_config.NumberColumn(format="%.3f"),
-            "notes": st.column_config.TextColumn("Notes"),
-            "updated_at": st.column_config.TextColumn("Updated"),
-            "_orig_sku": st.column_config.TextColumn("Original SKU", help="Used for renames; read-only", disabled=True, width="small"),
+    # Add blank rows helper UI
+    add_cols = st.columns([1,1,6,2])
+    add_n = add_cols[0].number_input("Add rows", min_value=1, max_value=50, value=1, step=1)
+    if add_cols[1].button("➕ Add blank row(s)"):
+        st.session_state.inv_new_rows += int(add_n)
+
+    # Build DataFrame with extra blank rows (not yet committed)
+    def _blank_row_dict():
+        return {
+            "sku": "", "serial_no": "", "name": "", "category": "", "location": "", "unit": "",
+            "quantity": 0.0, "min_qty": 0.0, "unit_cost": 0.0,
+            "convert_to": "", "convert_factor": 0.0, "notes": "", "updated_at": "",
+            "_orig_sku": ""
         }
 
-        # Order with _orig_sku at the far right
-        show_cols = ["sku","serial_no","name","category","location","unit","quantity","min_qty","unit_cost",
-                     "convert_to","convert_factor","notes","updated_at","_orig_sku"]
-        show_cols = [c for c in show_cols if c in fdf.columns]
+    if st.session_state.inv_new_rows > 0:
+        blanks = pd.DataFrame([_blank_row_dict() for _ in range(st.session_state.inv_new_rows)])
+        fdf = pd.concat([fdf, blanks], ignore_index=True)
 
-        edited = st.data_editor(
-            fdf[show_cols],
-            use_container_width=True,
-            num_rows="dynamic",
-            key="inv_editor",
-            height=900,
-            column_config=column_config
-        )
+    # Editor config
+    column_config = {
+        "sku": st.column_config.TextColumn("SKU", help="Required"),
+        "serial_no": st.column_config.TextColumn("Serial Number"),
+        "name": st.column_config.TextColumn("Name", help="Required"),
+        "category": st.column_config.TextColumn("Category"),
+        "location": st.column_config.TextColumn("Location"),
+        "unit": st.column_config.TextColumn("Unit"),
+        "quantity": st.column_config.NumberColumn(format="%.3f"),
+        "min_qty": st.column_config.NumberColumn(format="%.3f"),
+        "unit_cost": st.column_config.NumberColumn(format="%.2f"),
+        "convert_to": st.column_config.TextColumn("Convert To"),
+        "convert_factor": st.column_config.NumberColumn(format="%.3f"),
+        "notes": st.column_config.TextColumn("Notes"),
+        "updated_at": st.column_config.TextColumn("Updated", help="Auto"),
+        "_orig_sku": st.column_config.TextColumn("Original SKU", help="Used for renames; read-only", disabled=True, width="small"),
+    }
 
-        # SAVE: upsert/rename for existing rows, delete rows removed from the grid
-        if st.button("Save Edits (Upsert / Rename / Delete removed rows)"):
-            # Sets for deletion detection
-            original_skus = set(fdf["_orig_sku"].astype(str).tolist())
-            remaining_rows = edited  # rows user kept (possibly with changed 'sku')
-            kept_orig_skus = set(remaining_rows["_orig_sku"].astype(str).tolist()) if "_orig_sku" in remaining_rows.columns else set()
+    show_cols = ["sku","serial_no","name","category","location","unit",
+                 "quantity","min_qty","unit_cost","convert_to","convert_factor","notes","updated_at","_orig_sku"]
 
-            # Upsert + handle rename
-            upserts = 0
-            renames = 0
-            for _, r in remaining_rows.iterrows():
-                new_sku = (r.get("sku") or "").strip()
-                orig_sku = (r.get("_orig_sku") or "").strip()
-                name = (r.get("name") or "").strip()
+    edited = st.data_editor(
+        fdf[show_cols],
+        use_container_width=True,
+        num_rows="dynamic",
+        key="inv_editor",
+        height=900,
+        column_config=column_config
+    )
 
-                if not new_sku or not name:
-                    # Skip invalid rows
-                    continue
+    # SAVE: upsert/rename for kept rows; delete rows removed from the grid; add brand-new rows
+    if add_cols[3].button("💾 Save (Upsert / Rename / Delete removed)"):
+        # Sets for deletion detection (original items only)
+        original_skus = set(df["sku"].astype(str).tolist()) if not df.empty else set()
 
-                payload = {
-                    "sku": new_sku,
-                    "serial_no": (r.get("serial_no") or None),
-                    "name": name,
-                    "category": normalize_category(r.get("category")),
-                    "location": r.get("location"),
-                    "unit": r.get("unit"),
-                    "quantity": float(r.get("quantity") or 0),
-                    "min_qty": float(r.get("min_qty") or 0),
-                    "unit_cost": float(r.get("unit_cost") or 0),
-                    "notes": r.get("notes"),
-                    "convert_to": r.get("convert_to"),
-                    "convert_factor": float(r.get("convert_factor") or 0),
-                    "image_path": None,
-                }
+        # Normalize NaNs
+        edited = edited.fillna({"sku":"", "name":"", "_orig_sku":""})
 
-                if orig_sku and new_sku != orig_sku:
-                    # Rename: delete old key, then upsert new
-                    try:
-                        delete_item(orig_sku)
-                    except Exception:
-                        pass
-                    add_or_update_item(payload)
-                    renames += 1
-                else:
-                    add_or_update_item(payload)
-                    upserts += 1
+        # Upsert & rename
+        upserts = 0
+        renames = 0
+        creates = 0
+        seen_targets = set()  # avoid double-processing same SKU if duplicated in grid
 
-            # Deletions: any original rows not present now
-            deleted_skus = list(original_skus - kept_orig_skus)
-            deletions = 0
-            for sku_del in deleted_skus:
+        for _, r in edited.iterrows():
+            new_sku = (r.get("sku") or "").strip()
+            orig_sku = (r.get("_orig_sku") or "").strip()
+            name = (r.get("name") or "").strip()
+
+            # Skip empty placeholder rows
+            if new_sku == "" and name == "":
+                continue
+
+            # Require SKU & Name for persistence
+            if not new_sku or not name:
+                continue
+
+            # Build payload
+            payload = {
+                "sku": new_sku,
+                "serial_no": (r.get("serial_no") or None),
+                "name": name,
+                "category": normalize_category(r.get("category")),
+                "location": (r.get("location") or None),
+                "unit": (r.get("unit") or None),
+                "quantity": float(r.get("quantity") or 0),
+                "min_qty": float(r.get("min_qty") or 0),
+                "unit_cost": float(r.get("unit_cost") or 0),
+                "notes": (r.get("notes") or None),
+                "convert_to": (r.get("convert_to") or None),
+                "convert_factor": float(r.get("convert_factor") or 0),
+                "image_path": None,
+            }
+
+            if new_sku in seen_targets:
+                continue
+            seen_targets.add(new_sku)
+
+            if orig_sku and new_sku != orig_sku and orig_sku in original_skus:
                 try:
-                    delete_item(sku_del)
-                    deletions += 1
+                    delete_item(orig_sku)
                 except Exception:
                     pass
+                add_or_update_item(payload)
+                renames += 1
+            else:
+                # New or existing
+                if new_sku not in original_skus:
+                    creates += 1
+                else:
+                    upserts += 1
+                add_or_update_item(payload)
 
-            st.success(f"Saved: {upserts} upserts | {renames} renames | {deletions} deletions.")
-            st.rerun()
-    else:
-        st.info("No items yet. Add your first item above.")
+        # Deletions: any original SKUs not present in edited rows' _orig_sku
+        kept_orig_skus = set(edited["_orig_sku"].astype(str).tolist()) if "_orig_sku" in edited.columns else set()
+        deleted_skus = list(original_skus - kept_orig_skus)
+        deletions = 0
+        for sku_del in deleted_skus:
+            try:
+                delete_item(sku_del)
+                deletions += 1
+            except Exception:
+                pass
+
+        # Reset added blanks cache and refresh
+        st.session_state.inv_new_rows = 0
+        st.success(f"Saved: {creates} new | {upserts} updates | {renames} renames | {deletions} deletions.")
+        st.rerun()
 
     st.divider()
     colA, colB = st.columns(2)
