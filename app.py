@@ -1,10 +1,8 @@
 # app.py — OpperWorks Stock Take (Streamlit)
-# Update: Inventory page simplified to a single fully-editable grid.
-# - No separate "metadata" list or add form.
-# - Add items by inserting new rows in the grid (num_rows="dynamic").
-# - Edit any field (including SKU) and Save.
-# - Save performs Upsert + Rename (when SKU changed) + Delete (rows removed).
-# - Rest of the app unchanged (PDFs, Issue Sheets, Snapshots, etc.).
+# Update: Fix in-grid editing persistence + safe delete (only deletes rows removed from the *visible* grid).
+# - All columns editable (incl. SKU); Updated timestamp auto-filled on save.
+# - Deletions only affect rows that were visible in the editor before saving (filters no longer wipe other items).
+# - Added disabled "Updated" column; minor branding auto-detect tweak (OpperWorks logo fallback).
 
 import os, json, re, io, zipfile, glob, math, shutil
 import datetime as dt
@@ -147,16 +145,18 @@ email_recipients = get_setting("email_recipients", "")
 auto_backup_enabled = str(get_setting("auto_backup_enabled", "true")).lower() in {"1","true","yes","on"}
 brand_rgb = hex_to_rgb(brand_color)
 
-# Try auto-detect bundled PG Bison logo on first run
+# Try auto-detect bundled logos on first run (OpperWorks first, then PG Bison)
 if not logo_path:
     try:
-        pg_bison_src = "/mnt/data/PG Bison.jpg"
-        if os.path.exists(pg_bison_src):
-            dst = os.path.join(ASSETS_DIR, "brand_logo.jpg")
-            if not os.path.exists(dst):
-                shutil.copyfile(pg_bison_src, dst)
-            upsert_setting("logo_path", dst)
-            logo_path = dst
+        for candidate in ["/mnt/data/OpperWorks Logo.png", "/mnt/data/PG Bison.jpg"]:
+            if os.path.exists(candidate):
+                ext = os.path.splitext(candidate)[1].lower() or ".png"
+                dst = os.path.join(ASSETS_DIR, f"brand_logo{ext}")
+                if not os.path.exists(dst):
+                    shutil.copyfile(candidate, dst)
+                upsert_setting("logo_path", dst)
+                logo_path = dst
+                break
     except Exception:
         pass
 
@@ -933,6 +933,9 @@ def view_inventory():
     # Add an "orig_sku" reference column (read-only) to enable rename+delete logic
     fdf["orig_sku"] = fdf["sku"]
 
+    # --- NEW: capture which rows were visible BEFORE editing (for safe deletion) ---
+    visible_before_skus = set(fdf["orig_sku"].dropna().astype(str))
+
     st.subheader("Inventory (editable grid)")
     show_cols = ["sku","serial_no","name","category","location","unit","quantity","min_qty","unit_cost",
                  "convert_to","convert_factor","notes","updated_at","orig_sku"]
@@ -948,6 +951,7 @@ def view_inventory():
             "min_qty": st.column_config.NumberColumn(format="%.3f"),
             "unit_cost": st.column_config.NumberColumn(format="%.2f"),
             "convert_factor": st.column_config.NumberColumn(format="%.3f"),
+            "updated_at": st.column_config.TextColumn("Updated", disabled=True),
             "orig_sku": st.column_config.TextColumn("Orig SKU (ref)", disabled=True),
         }
     )
@@ -957,7 +961,9 @@ def view_inventory():
         def _s(x):
             return str(x).strip() if pd.notna(x) and str(x).strip() != "" else None
 
-        # All new SKUs present after edit (used for deletion pass)
+        now_ts = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        # All new SKUs present after edit (used for safe deletion pass)
         new_skus_after = set()
         rows = edited.to_dict("records")
         for r in rows:
@@ -984,6 +990,7 @@ def view_inventory():
                 "convert_to": _s(r.get("convert_to")),
                 "convert_factor": float(r.get("convert_factor") or 0),
                 "image_path": None,
+                "updated_at": now_ts,
             }
 
             orig = _s(r.get("orig_sku"))
@@ -998,9 +1005,9 @@ def view_inventory():
                 # Upsert
                 add_or_update_item(payload)
 
-        # Deletions: anything that existed but is no longer present after save
-        original_skus = set(str(x.get("sku")) for x in items if x.get("sku"))
-        to_delete = original_skus - new_skus_after
+        # --- NEW: Safe deletions ONLY for rows that were visible before editing ---
+        # Prevents accidental deletion of items hidden by filters.
+        to_delete = (visible_before_skus - new_skus_after)
         for sku in to_delete:
             try:
                 delete_item(sku)
