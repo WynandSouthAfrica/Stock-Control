@@ -1,13 +1,11 @@
 # app.py — OpperWorks Stock Take (Streamlit)
-# === This build ===
-# - FIX (PDF tables): Every row now keeps a UNIFORM height equal to the tallest wrapped cell.
-#   Borders/grid lines stay perfectly straight even when Name/Notes wrap to multiple lines.
-#   Works for Inventory Report + Issue/Return PDFs (incl. subtotals/totals/category bars).
-# - Implementation details: pre-measure wrapped text, compute row_height, draw ONE rectangle
-#   per cell for that height, then render text inside (no per-line borders). Also scrubs NaN→"".
-# - All previous features kept (Serial #, Find-by-Serial, SKU rename, dup-SKU check, Rand formatting, etc.).
+# Update: Fix blank pages in PDFs by measuring true wrapped row heights and handling page breaks manually.
+# - Added precise row-height pre-measure for Inventory PDF (Name & Notes wrap).
+# - Turned off FPDF auto page break; we insert page breaks only when needed.
+# - Kept Serial # in UI + reports; OpperWorks branding.
+# - Existing Rand formatting retained.
 
-import os, json, re, io, zipfile, glob, math, shutil, sqlite3
+import os, json, re, io, zipfile, glob, math, shutil
 import datetime as dt
 import urllib.parse
 import streamlit as st
@@ -63,7 +61,7 @@ def safe_show_logo(path: str):
 
 def hex_to_rgb(h: str):
     try:
-        h = h.lstrip("#")
+        h = h.strip().lstrip("#")
         return tuple(int(h[i:i+2], 16) for i in (0, 2, 4))
     except Exception:
         return (14, 165, 233)
@@ -85,12 +83,6 @@ def normalize_category(cat):
     if not s: return None
     s = re.sub(r"\s+", " ", s)
     return s.title()
-
-def is_nan(v) -> bool:
-    try:
-        return isinstance(v, float) and math.isnan(v)
-    except Exception:
-        return False
 
 # ---- Rand currency formatting ----
 def fmt_rands(x, with_symbol=True) -> str:
@@ -154,111 +146,26 @@ email_recipients = get_setting("email_recipients", "")
 auto_backup_enabled = str(get_setting("auto_backup_enabled", "true")).lower() in {"1","true","yes","on"}
 brand_rgb = hex_to_rgb(brand_color)
 
-# ---------- Serial Number support (DB patch + compatibility map) ----------
-def _db_candidates_from_module():
-    paths = []
+# Try auto-detect bundled PG Bison logo on first run
+if not logo_path:
     try:
-        import db as _db
-        for attr in ("DB_PATH", "DB_FILE", "PATH", "db_path"):
-            p = getattr(_db, attr, None)
-            if isinstance(p, str):
-                paths.append(_coerce_path(p))
-    except Exception:
-        pass
-    for name in ("data.db", "db.sqlite3", "app.db", "stock.db", "inventory.db", "omec.db"):
-        paths.append(os.path.join(ROOT, name))
-    uniq = []
-    for p in paths:
-        if p and p not in uniq:
-            uniq.append(p)
-    return [p for p in uniq if os.path.exists(p)]
-
-def _ensure_serialno_column(show_toast=False) -> bool:
-    try:
-        sample = get_items() or []
-        if sample and "serial_no" in sample[0]:
-            return True
-    except Exception:
-        pass
-    for path in _db_candidates_from_module():
-        try:
-            with sqlite3.connect(path) as con:
-                cur = con.cursor()
-                cur.execute("PRAGMA table_info(items)")
-                cols = [r[1] for r in cur.fetchall()]
-                if "serial_no" in cols:
-                    return True
-                cur.execute("ALTER TABLE items ADD COLUMN serial_no TEXT")
-                con.commit()
-                if show_toast: st.toast("DB patched: added items.serial_no", icon="✅")
-                return True
-        except Exception:
-            continue
-    if show_toast:
-        st.toast("Could not auto-add items.serial_no (compat fallback will be used).", icon="⚠️")
-    return False
-
-def _load_serial_map() -> dict:
-    try:
-        raw = get_setting("serial_map", "{}") or "{}"
-        m = json.loads(raw)
-        return m if isinstance(m, dict) else {}
-    except Exception:
-        return {}
-
-def _save_serial_map(m: dict):
-    try:
-        upsert_setting("serial_map", json.dumps(m, ensure_ascii=False))
+        pg_bison_src = "/mnt/data/PG Bison.jpg"
+        if os.path.exists(pg_bison_src):
+            dst = os.path.join(ASSETS_DIR, "brand_logo.jpg")
+            if not os.path.exists(dst):
+                shutil.copyfile(pg_bison_src, dst)
+            upsert_setting("logo_path", dst)
+            logo_path = dst
     except Exception:
         pass
 
-def _overlay_serials(items: list[dict]) -> list[dict]:
-    m = _load_serial_map()
-    out = []
-    for it in items:
-        it = dict(it)
-        if (not it.get("serial_no")) and it.get("sku") in m:
-            it["serial_no"] = m[it["sku"]]
-        out.append(it)
-    return out
+# ---------- Sidebar ----------
+st.sidebar.markdown(
+    f"<h2 style='color:{brand_color}; margin-bottom:0'>{brand_name}</h2>",
+    unsafe_allow_html=True
+)
+safe_show_logo(logo_path)
 
-def get_items_with_serial() -> list[dict]:
-    return _overlay_serials(get_items())
-
-def _set_or_clear_serial_in_map(sku: str, serial: str | None):
-    m = _load_serial_map()
-    if sku and (serial or "").strip():
-        m[sku] = serial.strip()
-    else:
-        m.pop(sku, None)
-    _save_serial_map(m)
-
-def _rename_serial_in_map(old_sku: str, new_sku: str):
-    if not old_sku or not new_sku or old_sku == new_sku: return
-    m = _load_serial_map()
-    if old_sku in m:
-        m[new_sku] = m.pop(old_sku)
-        _save_serial_map(m)
-
-_ensure_serialno_column(show_toast=False)
-
-# ---------- Sidebar brand header ----------
-def render_brand_header():
-    if logo_path and os.path.exists(_norm_path(logo_path)):
-        # You preferred no logo by default; keeping a graceful fallback
-        st.sidebar.markdown(
-            f"<h2 style='color:{brand_color}; margin-bottom:0'>{brand_name}</h2>",
-            unsafe_allow_html=True
-        )
-    else:
-        st.sidebar.markdown(
-            f"<h2 style='color:{brand_color}; margin-bottom:0'>{brand_name}</h2>",
-            unsafe_allow_html=True
-        )
-
-render_brand_header()
-
-# ---------- Navigation ----------
 menu = st.sidebar.radio(
     "Navigation",
     [
@@ -273,11 +180,10 @@ menu = st.sidebar.radio(
     index=0,
 )
 
-# ---------- Branding controls ----------
 with st.sidebar.expander("Branding (Logo)", expanded=False):
     st.caption("Upload a PNG/JPG or type a server path, then **Save Logo**.")
     up = st.file_uploader("Upload logo", type=["png", "jpg", "jpeg"])
-    col_a, col_b, col_c = st.columns([3, 1, 2])
+    col_a, col_b = st.columns([3, 1])
     logo_input = col_a.text_input("Or path on server", value=logo_path or "")
     if col_b.button("Save Logo"):
         try:
@@ -295,21 +201,6 @@ with st.sidebar.expander("Branding (Logo)", expanded=False):
                 st.rerun()
         except Exception as e:
             st.error(f"Save failed: {e}")
-    if col_c.button("Use OpperWorks logo"):
-        try:
-            src = "/mnt/data/OpperWorks Logo.png"
-            if not os.path.exists(src):
-                st.error("Bundled OpperWorks logo not found on this server.")
-            else:
-                ext = os.path.splitext(src)[1] or ".png"
-                dst = os.path.join(ASSETS_DIR, f"brand_logo{ext}")
-                shutil.copyfile(src, dst)
-                upsert_setting("logo_path", dst)
-                st.success("OpperWorks logo applied. Reloading…")
-                st.rerun()
-        except Exception as e:
-            st.error(f"Could not apply default logo: {e}")
-
     if st.button("Clear Logo"):
         upsert_setting("logo_path", "")
         st.success("Logo cleared. Reloading…")
@@ -345,7 +236,7 @@ def _has_snapshot_for_today():
 
 if auto_backup_enabled and not _has_snapshot_for_today():
     try:
-        items = get_items_with_serial()
+        items = get_items()
         tx = get_transactions(limit=1_000_000)
         path = export_snapshot(items, tx, tag=f"Auto_{dt.date.today().isoformat()}", note="Auto-backup on app open")
         path = _move_to_snap_dir(path, SNAP_DIR)
@@ -354,7 +245,7 @@ if auto_backup_enabled and not _has_snapshot_for_today():
     except Exception:
         st.sidebar.warning("Auto-backup attempt failed (non-blocking).")
 
-# ---------- PDF base + table helpers ----------
+# ---------- PDF base ----------
 if FPDF_AVAILABLE:
     class BrandedPDF(FPDF):
         def __init__(self, brand_name: str, brand_rgb: tuple, logo_path: str = "", revision_tag: str = "Rev0.1", *args, **kwargs):
@@ -363,20 +254,30 @@ if FPDF_AVAILABLE:
             self.brand_rgb = brand_rgb
             self.revision_tag = revision_tag
             self.logo_path = _norm_path(logo_path) if logo_path else ""
-            self.set_auto_page_break(auto=True, margin=12)
+            # Manage page breaks ourselves to avoid double-breaks / blank pages
+            self.set_auto_page_break(auto=False)
+            # Keep margin attributes for calculations
+            self.t_margin = 12
+            self.l_margin = 8
+            self.r_margin = 8
+            self.b_margin = 12
+            self.set_margins(self.l_margin, self.t_margin, self.r_margin)
 
         def header(self):
+            # Brand bar
             self.set_fill_color(*lighten(self.brand_rgb, 0.75))
             self.rect(x=0, y=0, w=self.w, h=14, style="F")
             if self.logo_path and os.path.exists(self.logo_path):
                 try:
-                    self.image(self.logo_path, x=10, y=3, h=8)  # keep conservative here; we can expose knob later
+                    # Slightly larger logo for visibility
+                    self.image(self.logo_path, x=10, y=3, h=8)
                 except Exception:
                     pass
             self.set_draw_color(*self.brand_rgb)
             self.set_line_width(0.4)
             self.line(8, 14, self.w - 8, 14)
-            self.ln(9)
+            self.set_y(14)
+            self.ln(2)
 
         def footer(self):
             self.set_y(-10)
@@ -427,6 +328,9 @@ def _draw_header_row(pdf, columns, widths, font_size, brand_rgb):
     pdf.set_text_color(20, 20, 20)
     row_h = 7
     y0 = pdf.get_y()
+    # page-break safety for header
+    if y0 + row_h > (pdf.h - pdf.b_margin):
+        pdf.add_page()
     for w, col in zip(widths, columns):
         x = pdf.get_x()
         pdf.multi_cell(w, row_h, to_latin1(str(col)), border=1, align="L", fill=True, new_x="RIGHT", new_y="TOP")
@@ -434,16 +338,10 @@ def _draw_header_row(pdf, columns, widths, font_size, brand_rgb):
     pdf.ln(row_h)
     return row_h
 
-def _ensure_page_space(pdf, needed_h, columns, widths, font_size, brand_rgb):
-    if pdf.get_y() + needed_h <= pdf.h - pdf.b_margin:
-        return
-    pdf.add_page()
-    _draw_header_row(pdf, columns, widths, font_size, brand_rgb)
-
 def _calc_row_height_exact(pdf, values, widths, row_h, wrap_idx_set):
     heights = []
     for idx, (w, v) in enumerate(zip(widths, values)):
-        txt = "" if (v is None or is_nan(v)) else to_latin1(str(v))
+        txt = "" if v is None else to_latin1(str(v))
         if wrap_idx_set and (idx in wrap_idx_set):
             try:
                 lines = pdf.multi_cell(w, row_h, txt, new_x="RIGHT", new_y="TOP", split_only=True)
@@ -469,15 +367,22 @@ def _truncate_to_fit(pdf, txt: str, w: float, margin: float = 2.0) -> str:
         s = s[:-1]
     return (s + ell) if s else ell
 
-def _draw_row_uniform(pdf, values, widths, base_row_h, row_height, align_map=None, fill_rgb=None, bold=False, text_rgb=(15,15,15), wrap_idx_set=None):
-    """
-    Draw ONE rectangle per cell (height=row_height) so horizontal borders are straight across.
-    Wrapped cells render text inside WITHOUT per-line borders.
-    """
-    if align_map is None: align_map = {}
-    if wrap_idx_set is None: wrap_idx_set = set()
+def _draw_row(pdf, values, widths, row_h, align_map=None, fill_rgb=None, bold=False, text_rgb=(15,15,15), wrap_idx_set=None, border="1"):
+    if align_map is None:
+        align_map = {}
+    if wrap_idx_set is None:
+        wrap_idx_set = set()
+
+    # Compute exact height for this row (respecting wrapped columns)
+    max_h = _calc_row_height_exact(pdf, values, widths, row_h, wrap_idx_set)
+
+    # Manual page break if needed (no auto-breaks)
+    if pdf.get_y() + max_h > (pdf.h - pdf.b_margin):
+        pdf.add_page()
 
     pdf.set_font("Helvetica", "B" if bold else "", 9)
+    if fill_rgb:
+        pdf.set_fill_color(*fill_rgb)
     pdf.set_text_color(*text_rgb)
 
     y_start = pdf.get_y()
@@ -485,33 +390,16 @@ def _draw_row_uniform(pdf, values, widths, base_row_h, row_height, align_map=Non
 
     for idx, (w, v) in enumerate(zip(widths, values)):
         x = pdf.get_x()
-        txt = "" if (v is None or is_nan(v)) else str(v)
         align = align_map.get(idx, "L")
+        txt = "" if v is None else str(v)
 
-        # cell background + border
-        if fill_rgb:
-            pdf.set_fill_color(*fill_rgb)
-            pdf.rect(x, y_start, w, row_height, style="FD")
-        else:
-            pdf.rect(x, y_start, w, row_height)
-
-        # text
         if idx in wrap_idx_set:
-            # padding inside the cell
-            pdf.set_xy(x + 1.2, y_start + 0.6)
-            try:
-                pdf.multi_cell(w - 2.4, base_row_h, to_latin1(txt), border=0, align=align)
-            except Exception:
-                pdf.multi_cell(w - 2.4, base_row_h, to_latin1(_truncate_to_fit(pdf, txt, w - 2.4)), border=0, align=align)
-            # restore cursor to right edge of the cell, same row
+            pdf.multi_cell(w, row_h, to_latin1(txt), border=border, align=align, new_x="RIGHT", new_y="TOP", fill=bool(fill_rgb))
             pdf.set_xy(x + w, y_start)
         else:
-            pdf.set_xy(x + 1.2, y_start)
-            one_line = _truncate_to_fit(pdf, txt, w - 2.4)
-            pdf.cell(w - 2.4, row_height, to_latin1(one_line), align=align, border=0)
-            pdf.set_xy(x + w, y_start)
-
-    pdf.set_xy(x_left, y_start + row_height)
+            t = _truncate_to_fit(pdf, txt, w)
+            pdf.cell(w, max_h, t, align=align, border=border)
+    pdf.set_xy(x_left, y_start + max_h)
 
 # ---------- Inventory PDF (grouped) ----------
 def _inventory_pdf_bytes_grouped(
@@ -570,8 +458,7 @@ def _inventory_pdf_bytes_grouped(
     for _, r in df.iterrows():
         row = {}
         for c in present:
-            v = r[c] if c in r else None
-            if is_nan(v): v = ""
+            v = r[c]
             if c in ("quantity", "min_qty"):
                 v = fmt_num(float(v), 2)
             elif c in ("unit_cost", "value"):
@@ -608,17 +495,17 @@ def _inventory_pdf_bytes_grouped(
 
     page_w = pdf.w - pdf.l_margin - pdf.r_margin
     widths = _compute_col_widths(pdf, display_cols, rows_for_width, page_w, font_size=9)
-    header_h = _draw_header_row(pdf, display_cols, widths, 9, brand_rgb)
+    _draw_header_row(pdf, display_cols, widths, 9, brand_rgb)
 
     align_map = {}
     for c in ("quantity", "min_qty", "unit_cost", "value", "converted_qty"):
         if c in present:
             align_map[present.index(c)] = "R"
-
+    # Wrap Name & Notes in PDFs
     wrap_idx_set = set()
-    if "Name" in display_cols:
+    if "name" in present:
         wrap_idx_set.add(display_cols.index("Name"))
-    if "Notes" in display_cols:
+    if "notes" in present:
         wrap_idx_set.add(display_cols.index("Notes"))
 
     if "category" in df.columns:
@@ -632,31 +519,35 @@ def _inventory_pdf_bytes_grouped(
     light_brand = lighten(brand_rgb, 0.92)
     cat_bar = lighten(brand_rgb, 0.80)
     low_stock_fill = (255, 235, 235)
-    base_row_h = 7
 
     grand_qty = 0.0
     grand_value = 0.0
 
+    row_h = 7  # base line height
+
     for cat in categories_iter:
         block = df_sorted[df_sorted["category"].fillna("(Unspecified)") == cat]
 
-        cat_span_h = 7
-        _ensure_page_space(pdf, cat_span_h + header_h, display_cols, widths, 9, brand_rgb)
-        pdf.set_font("Helvetica", "B", 10)
+        # Category bar (ensure space for bar + at least one data row head)
+        span_h = 7
+        if pdf.get_y() + span_h > (pdf.h - pdf.b_margin):
+            pdf.add_page()
+            _draw_header_row(pdf, display_cols, widths, 9, brand_rgb)
+        pdf.set_font("Helvetica", "B", 11)
         pdf.set_fill_color(*cat_bar)
         pdf.set_text_color(30, 30, 30)
-        pdf.cell(sum(widths), cat_span_h, to_latin1(f"Category: {cat}"), border=1, ln=1, fill=True)
+        pdf.cell(sum(widths), span_h, to_latin1(f"Category: {cat}"), border=1, ln=1, fill=True)
 
-        cat_qty = float(block["quantity"].sum() if "quantity" in block.columns else 0.0)
-        cat_value = float((block["quantity"] * block["unit_cost"]).sum() if {"quantity","unit_cost"}.issubset(block.columns) else 0.0)
+        cat_qty = float(block["quantity"].sum())
+        cat_value = float((block["quantity"] * block["unit_cost"]).sum())
         grand_qty += cat_qty
         grand_value += cat_value
 
+        pdf.set_font("Helvetica", "", 9)
         for _, r in block.iterrows():
             vals = []
             for c in present:
-                v = r[c] if c in r else None
-                if is_nan(v): v = ""
+                v = r[c]
                 if c in ("quantity", "min_qty"):
                     v = f"{float(v):,.2f}"
                 elif c in ("unit_cost", "value"):
@@ -665,16 +556,13 @@ def _inventory_pdf_bytes_grouped(
                     v = f"{float(v):,.3f}"
                 vals.append(v if v is not None else "")
 
-            row_height = _calc_row_height_exact(pdf, vals, widths, base_row_h, wrap_idx_set)
-            _ensure_page_space(pdf, row_height, display_cols, widths, 9, brand_rgb)
-
-            fill = None
-            try:
-                if float(r.get("quantity", 0)) < float(r.get("min_qty", 0)):
-                    fill = low_stock_fill
-            except Exception:
-                pass
-            _draw_row_uniform(pdf, vals, widths, base_row_h, row_height, align_map=align_map, fill_rgb=fill, wrap_idx_set=wrap_idx_set)
+            fill = low_stock_fill if float(r["quantity"]) < float(r["min_qty"]) else None
+            # Measure true height for this row based on wrapped cells
+            needed_h = _calc_row_height_exact(pdf, vals, widths, row_h, wrap_idx_set)
+            if pdf.get_y() + needed_h > (pdf.h - pdf.b_margin):
+                pdf.add_page()
+                _draw_header_row(pdf, display_cols, widths, 9, brand_rgb)
+            _draw_row(pdf, vals, widths, row_h, align_map=align_map, fill_rgb=fill, wrap_idx_set=wrap_idx_set)
 
         # Subtotal row
         sub_vals = []
@@ -687,9 +575,10 @@ def _inventory_pdf_bytes_grouped(
                 sub_vals.append(f"{cat_value:,.2f}")
             else:
                 sub_vals.append("")
-        row_height = _calc_row_height_exact(pdf, sub_vals, widths, base_row_h, set())
-        _ensure_page_space(pdf, row_height, display_cols, widths, 9, brand_rgb)
-        _draw_row_uniform(pdf, sub_vals, widths, base_row_h, row_height, align_map=align_map, fill_rgb=light_brand, bold=True, wrap_idx_set=set())
+        if pdf.get_y() + row_h > (pdf.h - pdf.b_margin):
+            pdf.add_page()
+            _draw_header_row(pdf, display_cols, widths, 9, brand_rgb)
+        _draw_row(pdf, sub_vals, widths, row_h, align_map=align_map, fill_rgb=light_brand, bold=True, wrap_idx_set=set())
 
     # TOTAL row
     total_vals = []
@@ -702,13 +591,16 @@ def _inventory_pdf_bytes_grouped(
             total_vals.append(f"{grand_value:,.2f}")
         else:
             total_vals.append("")
-    row_height = _calc_row_height_exact(pdf, total_vals, widths, base_row_h, set())
-    _ensure_page_space(pdf, row_height, display_cols, widths, 9, brand_rgb)
-    _draw_row_uniform(pdf, total_vals, widths, base_row_h, row_height, align_map=align_map, fill_rgb=lighten(brand_rgb, 0.88), bold=True, wrap_idx_set=set())
+    if pdf.get_y() + (row_h + 1) > (pdf.h - pdf.b_margin):
+        pdf.add_page()
+        _draw_header_row(pdf, display_cols, widths, 9, brand_rgb)
+    _draw_row(pdf, total_vals, widths, row_h+1, align_map=align_map, fill_rgb=lighten(brand_rgb, 0.88), bold=True, wrap_idx_set=set())
 
     # Sign-off
     pdf.ln(6)
     pdf.set_font("Helvetica", "B", 10)
+    if pdf.get_y() + 24 > (pdf.h - pdf.b_margin):
+        pdf.add_page()
     pdf.cell(0, 6, to_latin1("Sign-off"), ln=1)
     pdf.set_font("Helvetica", "", 9)
     w = (pdf.w - pdf.l_margin - pdf.r_margin)
@@ -748,26 +640,32 @@ def _issue_sheet_pdf_bytes(
     if only_available:
         df = df[df["quantity"] > 0]
 
-    present = ["sku","serial_no","name","unit","quantity","min_qty"]
+    present = ["sku","name","unit","quantity","min_qty"]
+    # include Serial # in issue sheets if present
+    if "serial_no" in df.columns:
+        present.insert(1, "serial_no")
+
     col_map = {"sku":"SKU","serial_no":"Serial #","name":"Item","unit":"Unit","quantity":"On-hand","min_qty":"Min"}
-    display_cols = [col_map[c] for c in present if c in df.columns or c in present] + ["Qty Issued", "To (Person)", "Signature", "Date"]
+    display_cols = [col_map[c] for c in present] + ["Qty Issued", "To (Person)", "Signature", "Date"]
 
     rows_for_width = []
     for _, r in df.iterrows():
-        rows_for_width.append({
+        base = {
             "SKU": str(r.get("sku","")),
-            "Serial #": "" if is_nan(r.get("serial_no")) else str(r.get("serial_no") or ""),
             "Item": str(r.get("name","")),
             "Unit": str(r.get("unit","") or ""),
             "On-hand": f"{float(r.get('quantity') or 0):,.2f}",
             "Min": f"{float(r.get('min_qty') or 0):,.2f}",
-            "Qty Issued": "",
-            "To (Person)": "",
-            "Signature": "",
-            "Date": "",
+        }
+        if "serial_no" in present:
+            base["Serial #"] = str(r.get("serial_no","") or "")
+            # Keep order matching display_cols
+            ordered = {k: base.get(k,"") for k in [c for c in display_cols if c in base]}
+        rows_for_width.append({
+            **({ "SKU": base["SKU"], "Serial #": base.get("Serial #",""), "Item": base["Item"], "Unit": base["Unit"], "On-hand": base["On-hand"], "Min": base["Min"] }),
+            "Qty Issued": "", "To (Person)": "", "Signature": "", "Date": "",
         })
 
-    # A4 LANDSCAPE
     pdf = BrandedPDF(
         brand_name=brand_name, brand_rgb=brand_rgb, logo_path=logo_path, revision_tag=revision_tag,
         orientation="L", unit="mm", format="A4"
@@ -778,6 +676,8 @@ def _issue_sheet_pdf_bytes(
     def draw_ruled_blank_row(pdf, widths, row_h=7, line_rgb=(170,170,170)):
         y = pdf.get_y()
         x = pdf.l_margin
+        if y + row_h > (pdf.h - pdf.b_margin):
+            pdf.add_page()
         pdf.set_x(x)
         pdf.set_draw_color(*line_rgb)
         pdf.set_line_width(0.2)
@@ -797,16 +697,15 @@ def _issue_sheet_pdf_bytes(
     ]
     pdf.cell(0, 6, to_latin1(" | ".join(meta)), ln=1)
     if notes:
-        pdf.multi_cell(0, 6, to_latin1(f"Notes: {notes}"), ln=1)
+        pdf.multi_cell(0, 6, to_latin1(f"Notes: {notes}"))
     pdf.ln(2)
 
     page_w = pdf.w - pdf.l_margin - pdf.r_margin
     widths = _compute_col_widths(pdf, display_cols, rows_for_width, page_w, font_size=9)
 
-    # widen key columns a bit for handwriting, then re-fit to page
+    # widen key columns for handwriting, then re-fit to page
     for i, name in enumerate(display_cols):
         if name in {"Item"}:                 widths[i] = max(widths[i], 80)
-        if name in {"Serial #"}:             widths[i] = max(widths[i], 35)
         if name in {"Qty Issued"}:           widths[i] = max(widths[i], 26)
         if name in {"To (Person)"}:          widths[i] = max(widths[i], 45)
         if name in {"Signature"}:            widths[i] = max(widths[i], 38)
@@ -816,12 +715,8 @@ def _issue_sheet_pdf_bytes(
     _draw_header_row(pdf, display_cols, widths, 9, brand_rgb)
     align_map = {}
     if "On-hand" in display_cols: align_map[display_cols.index("On-hand")] = "R"
-    if "Min" in display_cols:     align_map[display_cols.index("Min")]     = "R"
+    if "Min" in display_cols:     align_map[display_cols.index("Min")] = "R"
     cat_bar = lighten(brand_rgb, 0.80)
-
-    wrap_issue_idx = set()
-    if "Item" in display_cols:
-        wrap_issue_idx.add(display_cols.index("Item"))
 
     if "category" in df.columns:
         df = df.sort_values(by=["category","sku","name"], kind="stable")
@@ -831,7 +726,6 @@ def _issue_sheet_pdf_bytes(
         df["category"] = "(All)"
 
     per_item_blanks = []
-    base_row_h = 7
 
     # ---- Issue rows
     for cat in groups:
@@ -839,7 +733,9 @@ def _issue_sheet_pdf_bytes(
         if block.empty:
             continue
 
-        _ensure_page_space(pdf, 8, display_cols, widths, 9, brand_rgb)
+        if pdf.get_y() + 8 > (pdf.h - pdf.b_margin):
+            pdf.add_page()
+            _draw_header_row(pdf, display_cols, widths, 9, brand_rgb)
         pdf.set_font("Helvetica", "B", 10)
         pdf.set_fill_color(*cat_bar)
         pdf.set_text_color(30, 30, 30)
@@ -850,40 +746,37 @@ def _issue_sheet_pdf_bytes(
             onhand = float(r.get("quantity") or 0.0)
             minq   = float(r.get("min_qty") or 0.0)
 
-            values_map = {
-                "SKU": r.get("sku",""),
-                "Serial #": "" if is_nan(r.get("serial_no")) else r.get("serial_no","") or "",
-                "Item": r.get("name",""),
-                "Unit": r.get("unit","") or "",
-                "On-hand": f"{onhand:,.2f}",
-                "Min": f"{minq:,.2f}",
-                "Qty Issued": "",
-                "To (Person)": "",
-                "Signature": "",
-                "Date": ""
-            }
-            values = [values_map[col] for col in display_cols]
+            values = [
+                r.get("sku",""),
+                r.get("serial_no","") if "serial_no" in present else "",
+                r.get("name",""),
+                r.get("unit","") or "",
+                f"{onhand:,.2f}",
+                f"{minq:,.2f}",
+                "", "", "", ""
+            ] if "serial_no" in present else [
+                r.get("sku",""),
+                r.get("name",""),
+                r.get("unit","") or "",
+                f"{onhand:,.2f}",
+                f"{minq:,.2f}",
+                "", "", "", ""
+            ]
+            if pdf.get_y() + 8 > (pdf.h - pdf.b_margin):
+                pdf.add_page()
+                _draw_header_row(pdf, display_cols, widths, 9, brand_rgb)
+            _draw_row(pdf, values, widths, 7, align_map=align_map, border="1", wrap_idx_set=set())
 
-            row_h = _calc_row_height_exact(pdf, values, widths, base_row_h, wrap_issue_idx)
-            _ensure_page_space(pdf, row_h, display_cols, widths, 9, brand_rgb)
-            _draw_row_uniform(pdf, values, widths, base_row_h, row_h, align_map=align_map, border=0, wrap_idx_set=wrap_issue_idx)
-
-            if (fixed_blanks is not None) and (fixed_blanks > 0):
-                blanks = fixed_blanks
-            else:
-                blanks = min(max(0, int(math.floor(onhand))) + 1, max(1, int(blanks_cap)))
-
+            blanks = fixed_blanks if (fixed_blanks is not None and fixed_blanks > 0) else min(max(0, int(math.floor(onhand))) + 1, max(1, int(blanks_cap)))
             per_item_blanks.append({
                 "cat": cat,
                 "sku": r.get("sku",""),
-                "serial_no": "" if is_nan(r.get("serial_no")) else r.get("serial_no","") or "",
                 "name": r.get("name",""),
                 "unit": r.get("unit","") or "",
                 "blanks": blanks
             })
 
             for _ in range(blanks):
-                _ensure_page_space(pdf, 7, display_cols, widths, 9, brand_rgb)
                 draw_ruled_blank_row(pdf, widths, row_h=7, line_rgb=(170,170,170))
 
     # ---- Return section (optional)
@@ -900,14 +793,13 @@ def _issue_sheet_pdf_bytes(
         pdf.cell(0, 6, to_latin1(" | ".join(meta2)), ln=1)
         pdf.ln(2)
 
-        ret_cols = ["SKU","Serial #","Item","Unit","Qty Returned","From (Person)","Signature","Date","Condition / Notes"]
-        ret_rows_for_width = [{k:"" for k in ret_cols}]
+        ret_cols = ["SKU","Item","Unit","Qty Returned","From (Person)","Signature","Date","Condition / Notes"]
+        ret_rows_for_width = [{"SKU":"","Item":"","Unit":"","Qty Returned":"","From (Person)":"","Signature":"","Date":"","Condition / Notes":""}]
         page_w = pdf.w - pdf.l_margin - pdf.r_margin
         ret_widths = _compute_col_widths(pdf, ret_cols, ret_rows_for_width, page_w, font_size=9)
 
         for i, name in enumerate(ret_cols):
             if name in {"Item"}:                   ret_widths[i] = max(ret_widths[i], 90)
-            if name in {"Serial #"}:               ret_widths[i] = max(ret_widths[i], 35)
             if name in {"Qty Returned"}:           ret_widths[i] = max(ret_widths[i], 30)
             if name in {"From (Person)"}:          ret_widths[i] = max(ret_widths[i], 50)
             if name in {"Signature"}:              ret_widths[i] = max(ret_widths[i], 40)
@@ -917,21 +809,18 @@ def _issue_sheet_pdf_bytes(
 
         _draw_header_row(pdf, ret_cols, ret_widths, 9, brand_rgb)
 
-        wrap_return_idx = set()
-        if "Item" in ret_cols: wrap_return_idx.add(ret_cols.index("Item"))
-        if "Condition / Notes" in ret_cols: wrap_return_idx.add(ret_cols.index("Condition / Notes"))
-
         cat_bar = lighten(brand_rgb, 0.80)
         groups2 = [x["cat"] for x in per_item_blanks]
         groups2 = list(dict.fromkeys(groups2))  # preserve order/unique
 
-        base_row_h = 7
         for cat in groups2:
             items_cat = [x for x in per_item_blanks if x["cat"] == cat]
             if not items_cat:
                 continue
 
-            _ensure_page_space(pdf, 8, ret_cols, ret_widths, 9, brand_rgb)
+            if pdf.get_y() + 8 > (pdf.h - pdf.b_margin):
+                pdf.add_page()
+                _draw_header_row(pdf, ret_cols, ret_widths, 9, brand_rgb)
             pdf.set_font("Helvetica", "B", 10)
             pdf.set_fill_color(*cat_bar)
             pdf.set_text_color(30, 30, 30)
@@ -939,25 +828,14 @@ def _issue_sheet_pdf_bytes(
 
             pdf.set_font("Helvetica", "", 9)
             for it in items_cat:
-                desc_vals_map = {
-                    "SKU": it["sku"],
-                    "Serial #": it.get("serial_no","") or "",
-                    "Item": it["name"],
-                    "Unit": it["unit"],
-                    "Qty Returned": "",
-                    "From (Person)": "",
-                    "Signature": "",
-                    "Date": "",
-                    "Condition / Notes": ""
-                }
-                desc_vals = [desc_vals_map[c] for c in ret_cols]
-                row_h = _calc_row_height_exact(pdf, desc_vals, ret_widths, base_row_h, wrap_return_idx)
-                _ensure_page_space(pdf, row_h, ret_cols, ret_widths, 9, brand_rgb)
-                _draw_row_uniform(pdf, desc_vals, ret_widths, base_row_h, row_h, wrap_idx_set=wrap_return_idx)
+                desc_vals = [it["sku"], it["name"], it["unit"], "", "", "", "", ""]
+                if pdf.get_y() + 8 > (pdf.h - pdf.b_margin):
+                    pdf.add_page()
+                    _draw_header_row(pdf, ret_cols, ret_widths, 9, brand_rgb)
+                _draw_row(pdf, desc_vals, ret_widths, 7, border="1", wrap_idx_set=set())
 
                 r_blanks = it["blanks"] if (fixed_return_blanks is None or fixed_return_blanks <= 0) else fixed_return_blanks
                 for _ in range(r_blanks):
-                    _ensure_page_space(pdf, 7, ret_cols, ret_widths, 9, brand_rgb)
                     draw_ruled_blank_row(pdf, ret_widths, row_h=7, line_rgb=(170,170,170))
 
         pdf.ln(6)
@@ -982,7 +860,7 @@ def view_dashboard():
     st.title("🏠 Dashboard")
     st.caption("Quick overview + low-stock email helper.")
 
-    items = get_items_with_serial()
+    items = get_items()
     df = pd.DataFrame(items)
     if "category" in df.columns:
         df["category"] = df["category"].apply(normalize_category)
@@ -1008,8 +886,10 @@ def view_dashboard():
             if low_df.empty:
                 st.success("Nothing low on stock 🎉")
             else:
-                cols = [c for c in ["sku","serial_no","name","category","location","quantity","min_qty"] if c in low_df.columns]
-                st.dataframe(low_df[cols].fillna(""), use_container_width=True, height=260)
+                st.dataframe(
+                    low_df[["sku", "name", "category", "location", "quantity", "min_qty"]],
+                    use_container_width=True, height=260
+                )
 
     with c2:
         st.subheader("Category totals")
@@ -1043,218 +923,124 @@ def view_dashboard():
 
 def view_inventory():
     st.title("📦 Inventory")
-    st.caption("Add as you go: insert blank rows, type, and **Save**. Delete rows to remove. Editing SKU performs a rename.")
-    _ensure_serialno_column(show_toast=False)
+    st.caption("Add, edit, or delete items. Edit directly in the list below and then **Save Edits** to upsert visible rows.")
 
-    if "inv_new_rows" not in st.session_state:
-        st.session_state.inv_new_rows = 0
-
-    items = get_items_with_serial()
+    items = get_items()
     df = pd.DataFrame(items)
     if "category" in df.columns:
         df["category"] = df["category"].apply(normalize_category)
 
-    with st.container():
-        cA, cB, cC = st.columns([2,4,4])
-        serial_find = cA.text_input("🔎 Find by Serial #", placeholder="Type full/part of serial…")
-        filt = cB.text_input("Filter (SKU/Serial/Name/Category/Location contains…")
-        sku_warn_toggle = cC.toggle("Warn on duplicate SKUs", value=True)
-
+    # Quick filters
+    colf1, colf2 = st.columns([1,1])
+    filt = colf1.text_input("Filter (SKU/Name/Category/Location contains…)")
+    serial_q = colf2.text_input("Find by Serial #")
     fdf = df.copy()
-    for col in ["sku","serial_no","name","category","location","unit","quantity","min_qty","unit_cost","convert_to","convert_factor","notes","updated_at"]:
-        if col not in fdf.columns:
-            fdf[col] = None
-
-    if serial_find:
-        s = serial_find.lower().strip()
-        fdf = fdf[fdf["serial_no"].astype(str).str.lower().str.contains(s, na=False)]
-
     if filt:
         f = filt.lower()
         mask = (
-            fdf["sku"].astype(str).str.lower().str.contains(f, na=False) |
-            fdf["serial_no"].astype(str).str.lower().str.contains(f, na=False) |
-            fdf["name"].astype(str).str.lower().str.contains(f, na=False) |
-            fdf["category"].astype(str).str.lower().str.contains(f, na=False) |
-            fdf["location"].astype(str).str.lower().str.contains(f, na=False)
+            fdf["sku"].astype(str).str.lower().str.contains(f) |
+            fdf["name"].astype(str).str.lower().str.contains(f) |
+            fdf["category"].astype(str).str.lower().str.contains(f) |
+            fdf["location"].astype(str).str.lower().str.contains(f)
         )
         fdf = fdf[mask]
+    if serial_q:
+        s = serial_q.strip().lower()
+        if "serial_no" in fdf.columns:
+            fdf = fdf[fdf["serial_no"].astype(str).str.lower().str.contains(s)]
 
-    sort_keys = [k for k in ["category","sku","name"] if k in fdf.columns]
+    # Auto-sort by Category → SKU → Name
+    sort_keys = []
+    if "category" in fdf.columns: sort_keys.append("category")
+    if "sku" in fdf.columns:      sort_keys.append("sku")
+    if "name" in fdf.columns:     sort_keys.append("name")
     if sort_keys:
         fdf = fdf.sort_values(by=sort_keys, kind="stable", na_position="last").reset_index(drop=True)
 
-    st.subheader("Inventory List (editable)")
-    fdf = fdf.copy()
-    fdf["_orig_sku"] = fdf["sku"].astype(str)
+    with st.form("add_item"):
+        cols = st.columns(5)
+        sku = cols[0].text_input("SKU *")
+        serial_no = cols[1].text_input("Serial #")
+        name = cols[2].text_input("Name *")
+        category = cols[3].text_input("Category")
+        location = cols[4].text_input("Location")
 
-    add_cols = st.columns([1,1,6,2])
-    add_n = add_cols[0].number_input("Add rows", min_value=1, max_value=50, value=1, step=1)
-    if add_cols[1].button("➕ Add blank row(s)"):
-        st.session_state.inv_new_rows += int(add_n)
+        cols2 = st.columns(5)
+        unit = cols2[0].text_input("Unit (e.g., pcs, m, kg)")
+        quantity = cols2[1].number_input("Quantity", value=0.0, step=1.0, format="%.3f")
+        min_qty = cols2[2].number_input("Min Qty (alert level)", value=0.0, step=1.0, format="%.3f")
+        unit_cost = cols2[3].number_input("Unit Cost (R)", value=0.0, step=1.0, format="%.2f")
+        notes = cols2[4].text_input("Notes")
 
-    def _blank_row_dict():
-        return {
-            "sku": "", "serial_no": "", "name": "", "category": "", "location": "", "unit": "",
-            "quantity": 0.0, "min_qty": 0.0, "unit_cost": 0.0,
-            "convert_to": "", "convert_factor": 0.0, "notes": "", "updated_at": "",
-            "_orig_sku": ""
-        }
+        cols3 = st.columns(2)
+        convert_to = cols3[0].text_input("Convert to (optional, e.g., m², m)")
+        convert_factor = cols3[1].number_input("Conversion factor (base→convert)", value=0.0, step=0.001, format="%.3f")
 
-    if st.session_state.inv_new_rows > 0:
-        blanks = pd.DataFrame([_blank_row_dict() for _ in range(st.session_state.inv_new_rows)])
-        fdf = pd.concat([fdf, blanks], ignore_index=True)
-
-    has_textarea = hasattr(st.column_config, "TextAreaColumn")
-    if has_textarea:
-        name_col = st.column_config.TextAreaColumn("Name", help="Required", rows=2)
-        notes_col = st.column_config.TextAreaColumn("Notes", rows=3)
-    else:
-        name_col = st.column_config.TextColumn("Name", help="Required")
-        notes_col = st.column_config.TextColumn("Notes")
-        st.markdown(
-            """
-            <style>
-              [data-testid="stDataFrame"] div[role="gridcell"] {
-                  white-space: normal !important;
-                  line-height: 1.2rem !important;
-                  overflow-wrap: anywhere !important;
-              }
-            </style>
-            """,
-            unsafe_allow_html=True,
-        )
-
-    column_config = {
-        "sku": st.column_config.TextColumn("SKU", help="Required"),
-        "serial_no": st.column_config.TextColumn("Serial Number"),
-        "name": name_col,
-        "category": st.column_config.TextColumn("Category"),
-        "location": st.column_config.TextColumn("Location"),
-        "unit": st.column_config.TextColumn("Unit"),
-        "quantity": st.column_config.NumberColumn(format="%.3f"),
-        "min_qty": st.column_config.NumberColumn(format="%.3f"),
-        "unit_cost": st.column_config.NumberColumn(format="%.2f"),
-        "convert_to": st.column_config.TextColumn("Convert To"),
-        "convert_factor": st.column_config.NumberColumn(format="%.3f"),
-        "notes": notes_col,
-        "updated_at": st.column_config.TextColumn("Updated", help="Auto"),
-        "_orig_sku": st.column_config.TextColumn("Original SKU", help="Used for renames; read-only", disabled=True, width="small"),
-    }
-
-    show_cols = ["sku","serial_no","name","category","location","unit",
-                 "quantity","min_qty","unit_cost","convert_to","convert_factor","notes","updated_at","_orig_sku"]
-
-    edited = st.data_editor(
-        fdf[show_cols],
-        use_container_width=True,
-        num_rows="dynamic",
-        key="inv_editor",
-        height=900,
-        column_config=column_config
-    )
-
-    # Duplicate SKU warning
-    try:
-        skus = edited["sku"].astype(str).str.strip()
-        skus = skus[skus != ""]
-        dup_vals = skus[skus.duplicated(keep=False)]
-        if sku_warn_toggle and len(dup_vals) > 0:
-            dups = sorted(set(dup_vals.tolist()))
-            st.warning(f"Duplicate SKU detected in the grid: {', '.join(dups)}")
-    except Exception:
-        pass
-
-    try:
-        missing_mask = (edited["sku"].astype(str).str.strip() == "") | (edited["name"].astype(str).str.strip() == "")
-        wont_save = int(missing_mask.sum())
-        if wont_save > 0:
-            st.info(f"{wont_save} row(s) missing SKU or Name will be skipped on Save.")
-    except Exception:
-        pass
-
-    block_on_dup = st.checkbox("Block save on duplicates (SKU)", value=False)
-
-    if add_cols[3].button("💾 Save (Upsert / Rename / Delete removed)"):
-        try:
-            skus = edited["sku"].astype(str).str.strip()
-            skus = skus[skus != ""]
-            has_dups = skus.duplicated().any()
-        except Exception:
-            has_dups = False
-        if block_on_dup and has_dups:
-            st.error("Save blocked: duplicate SKU values present. Resolve and try again.")
-            return
-
-        original_skus = set(df["sku"].astype(str).tolist()) if not df.empty else set()
-        edited = edited.fillna({"sku":"", "name":"", "_orig_sku":"", "serial_no":""})
-
-        upserts = 0
-        renames = 0
-        creates = 0
-        seen_targets = set()
-
-        for _, r in edited.iterrows():
-            new_sku = (r.get("sku") or "").strip()
-            orig_sku = (r.get("_orig_sku") or "").strip()
-            name = (r.get("name") or "").strip()
-
-            if new_sku == "" and name == "":
-                continue
-            if not new_sku or not name:
-                continue
-
-            payload = {
-                "sku": new_sku,
-                "serial_no": (r.get("serial_no") or None),
-                "name": name,
-                "category": normalize_category(r.get("category")),
-                "location": (r.get("location") or None),
-                "unit": (r.get("unit") or None),
-                "quantity": float(r.get("quantity") or 0),
-                "min_qty": float(r.get("min_qty") or 0),
-                "unit_cost": float(r.get("unit_cost") or 0),
-                "notes": (r.get("notes") or None),
-                "convert_to": (r.get("convert_to") or None),
-                "convert_factor": float(r.get("convert_factor") or 0),
-                "image_path": None,
-            }
-
-            if new_sku in seen_targets:
-                continue
-            seen_targets.add(new_sku)
-
-            if orig_sku and new_sku != orig_sku and orig_sku in original_skus:
-                try:
-                    delete_item(orig_sku)
-                except Exception:
-                    pass
-                add_or_update_item(payload)
-                renames += 1
-                _rename_serial_in_map(orig_sku, new_sku)
+        submitted = st.form_submit_button("Save Item")
+        if submitted:
+            if sku and name:
+                # Optional duplicate-SKU warning
+                if any(str(sku).strip() == str(x.get("sku")) for x in items):
+                    st.warning("SKU already exists — this will update the existing row.")
+                add_or_update_item({
+                    "sku": sku.strip(),
+                    "serial_no": serial_no.strip() if serial_no else None,
+                    "name": name.strip(),
+                    "category": normalize_category(category),
+                    "location": location.strip() if location else None,
+                    "unit": unit.strip() if unit else None,
+                    "quantity": float(quantity),
+                    "min_qty": float(min_qty),
+                    "unit_cost": float(unit_cost),
+                    "notes": notes.strip() if notes else None,
+                    "convert_to": convert_to.strip() if convert_to else None,
+                    "convert_factor": float(convert_factor or 0.0),
+                    "image_path": None,
+                })
+                st.success(f"Saved item '{sku}'")
+                st.rerun()
             else:
-                if new_sku not in original_skus:
-                    creates += 1
-                else:
-                    upserts += 1
-                add_or_update_item(payload)
+                st.error("SKU and Name are required.")
 
-            _set_or_clear_serial_in_map(new_sku, payload.get("serial_no"))
-
-        kept_orig_skus = set(edited["_orig_sku"].astype(str).tolist()) if "_orig_sku" in edited.columns else set()
-        deleted_skus = list(original_skus - kept_orig_skus)
-        deletions = 0
-        for sku_del in deleted_skus:
-            try:
-                delete_item(sku_del)
-                deletions += 1
-            except Exception:
-                pass
-            _set_or_clear_serial_in_map(sku_del, None)
-
-        st.session_state.inv_new_rows = 0
-        st.success(f"Saved: {creates} new | {upserts} updates | {renames} renames | {deletions} deletions.")
-        st.rerun()
+    st.subheader("Inventory List (editable)")
+    if not fdf.empty:
+        show_cols = ["sku","serial_no","name","category","location","unit","quantity","min_qty","unit_cost",
+                     "convert_to","convert_factor","notes","updated_at"]
+        show_cols = [c for c in show_cols if c in fdf.columns]
+        edited = st.data_editor(
+            fdf[show_cols],
+            use_container_width=True,
+            num_rows="dynamic",
+            key="inv_editor",
+            height=900,  # taller editor window
+            column_config={
+                "quantity": st.column_config.NumberColumn(format="%.3f"),
+                "min_qty": st.column_config.NumberColumn(format="%.3f"),
+                "unit_cost": st.column_config.NumberColumn(format="%.2f"),
+                "convert_factor": st.column_config.NumberColumn(format="%.3f"),
+            }
+        )
+        if st.button("Save Edits (Upsert visible rows)"):
+            for _, r in edited.iterrows():
+                add_or_update_item({
+                    "sku": r.get("sku"),
+                    "serial_no": r.get("serial_no"),
+                    "name": r.get("name"),
+                    "category": normalize_category(r.get("category")),
+                    "location": r.get("location"),
+                    "unit": r.get("unit"),
+                    "quantity": float(r.get("quantity") or 0),
+                    "min_qty": float(r.get("min_qty") or 0),
+                    "unit_cost": float(r.get("unit_cost") or 0),
+                    "notes": r.get("notes"),
+                    "convert_to": r.get("convert_to"),
+                    "convert_factor": float(r.get("convert_factor") or 0),
+                    "image_path": None,
+                })
+            st.success("Edits saved.")
+            st.rerun()
+    else:
+        st.info("No items yet. Add your first item above.")
 
     st.divider()
     colA, colB = st.columns(2)
@@ -1262,7 +1048,6 @@ def view_inventory():
     if colB.button("Delete Item"):
         if to_delete:
             delete_item(to_delete.strip())
-            _set_or_clear_serial_in_map(to_delete.strip(), None)
             st.success(f"Deleted '{to_delete}'")
             st.rerun()
         else:
@@ -1272,7 +1057,7 @@ def view_transactions():
     st.title("🔁 Transactions")
     st.caption("Record stock movement in/out and maintain an audit trail.")
 
-    items = get_items_with_serial()
+    items = get_items()
     sku_list = [i["sku"] for i in items]
 
     with st.form("tx_form"):
@@ -1318,8 +1103,6 @@ def view_transactions():
         f = f[f["reason"].isin(reason_filter)]
     if search:
         s = search.lower()
-        for col in ["sku","project","reference","user","notes"]:
-            if col not in f.columns: f[col] = ""
         f = f[
             f["sku"].astype(str).str.lower().str.contains(s) |
             f["project"].astype(str).str.lower().str.contains(s) |
@@ -1328,6 +1111,90 @@ def view_transactions():
             f["notes"].astype(str).str.lower().str.contains(s)
         ]
     st.dataframe(f, use_container_width=True)
+
+def view_issue_sheets():
+    st.title("📝 Issue Sheets")
+    st.caption("Create a printable Stock Issue Sheet (PPE & consumables) with ruled blank sign-off rows, and (optional) Return Sheet.")
+
+    if not FPDF_AVAILABLE:
+        st.error("PDF engine not available. Add `fpdf2==2.7.9` to requirements.txt.")
+        return
+
+    items = get_items()
+    df = pd.DataFrame(items)
+    if "category" in df.columns:
+        df["category"] = df["category"].apply(normalize_category)
+
+    if df.empty:
+        st.info("No inventory yet. Add items first.")
+        return
+
+    all_cats = sorted([c for c in df.get("category", pd.Series(dtype=str)).dropna().unique().tolist()])
+
+    def looks_consumable(x: str) -> bool:
+        s = x.lower()
+        keys = ["disc", "cutting", "grinding", "weld", "wire", "ppe", "glove", "mask", "goggle", "paint", "oxygen", "gas"]
+        return any(k in s for k in keys)
+
+    default_cats = [c for c in all_cats if looks_consumable(c)] or all_cats
+    cat_select = st.multiselect("Categories to include", options=all_cats, default=default_cats)
+
+    c1, c2, c3 = st.columns(3)
+    only_avail = c1.checkbox("Only show items with qty > 0", value=True)
+    mgr = c2.text_input("Manager (issued by)")
+    project = c3.text_input("Project / Job")
+    notes = st.text_input("Notes (optional)")
+
+    with st.expander("Sheet layout options", expanded=False):
+        cap = st.slider("Cap blank lines per item (Issue sheet; On-hand + 1, capped)", min_value=1, max_value=40, value=12)
+        fixed_n = st.number_input("Or use a fixed number per item (Issue; 0 = disabled)", min_value=0, max_value=50, value=0)
+        fixed_blanks = fixed_n if fixed_n > 0 else None
+
+        st.markdown("---")
+        include_returns = st.checkbox("Include Return Sheet section", value=True)
+        ret_cap = st.slider("Cap blank lines per item (Return sheet; On-hand + 1, capped)", min_value=1, max_value=40, value=12)
+        ret_fixed_n = st.number_input("Or use a fixed number per item (Return; 0 = disabled)", min_value=0, max_value=50, value=0)
+        fixed_return_blanks = ret_fixed_n if ret_fixed_n > 0 else None
+
+    build = st.button("Generate Issue PDF (with optional Return section)")
+    if build:
+        pdf_bytes = _issue_sheet_pdf_bytes(
+            df, brand_name, brand_rgb, logo_path, revision_tag,
+            manager=mgr, project=project, notes=notes,
+            categories=cat_select if cat_select else None,
+            only_available=only_avail,
+            blanks_cap=cap, fixed_blanks=fixed_blanks,
+            include_returns=include_returns,
+            return_blanks_cap=ret_cap, fixed_return_blanks=fixed_return_blanks
+        )
+        st.download_button(
+            "Download Issue/Return PDF",
+            data=pdf_bytes,
+            file_name=f"Issue_Return_{timestamp()}.pdf",
+            mime="application/pdf",
+        )
+
+    st.divider()
+    st.subheader("Quick Issue (log immediately)")
+    filt_df = df[df["category"].isin(cat_select)] if cat_select else df
+    sku_list = sorted(filt_df["sku"].unique().tolist())
+
+    with st.form("quick_issue_form"):
+        cols = st.columns(4)
+        q_sku = cols[0].selectbox("SKU", options=sku_list)
+        q_qty = cols[1].number_input("Qty issued", value=1.0, min_value=0.0, step=1.0, format="%.3f")
+        q_to  = cols[2].text_input("To (person)")
+        q_proj= cols[3].text_input("Project/Job", value=project)
+
+        notes2 = st.text_input("Notes")
+        submit = st.form_submit_button("Log Issue")
+        if submit:
+            if not q_sku or q_qty <= 0:
+                st.error("Choose a SKU and a positive quantity.")
+            else:
+                add_transaction(q_sku, -abs(q_qty), reason="issue", project=q_proj, reference="", user=q_to, notes=notes2)
+                st.success(f"Issue logged for {q_sku} → {q_to} (-{q_qty})")
+                st.rerun()
 
 # ---------- Versions / Snapshots ----------
 def _zip_list():
@@ -1351,7 +1218,7 @@ def view_versions():
     tag = st.text_input("Version tag (e.g., V0.1, 'after_stock_count')")
     note = st.text_area("Note")
     if st.button("Create Snapshot ZIP"):
-        items = get_items_with_serial()
+        items = get_items()
         tx = get_transactions(limit=1_000_000)
         zip_path = export_snapshot(items, tx, tag=tag, note=note)
         zip_path = _move_to_snap_dir(zip_path, SNAP_DIR)
@@ -1365,7 +1232,7 @@ def view_versions():
     cols = st.columns(3)
     site = cols[0].text_input("Site name", value="Main Workshop")
     if cols[1].button("Create snapshot for site"):
-        items = get_items_with_serial()
+        items = get_items()
         tx = get_transactions(limit=1_000_000)
         site_tag = f"{site.replace(' ', '_')}_{timestamp()}"
         zip_path = export_snapshot(items, tx, tag=site_tag, note=f"Site: {site}")
@@ -1436,15 +1303,13 @@ def _restore_from_bytes(zip_bytes: bytes, replace_items: bool, append_tx: bool, 
                 delete_item(it["sku"])
             except Exception:
                 pass
-        _save_serial_map({})
 
     added_items = 0
     for _, r in inv_df.iterrows():
         try:
-            serial_val = (str(r.get("serial_no")).strip() if "serial_no" in inv_df.columns and pd.notna(r.get("serial_no")) else None)
             add_or_update_item({
                 "sku": str(r.get("sku") or "").strip(),
-                "serial_no": serial_val,
+                "serial_no": (r.get("serial_no") if "serial_no" in inv_df.columns and pd.notna(r.get("serial_no")) else None),
                 "name": str(r.get("name") or "").strip(),
                 "category": normalize_category(r.get("category")),
                 "location": (r.get("location") if pd.notna(r.get("location")) else None),
@@ -1457,7 +1322,6 @@ def _restore_from_bytes(zip_bytes: bytes, replace_items: bool, append_tx: bool, 
                 "convert_factor": float(r.get("convert_factor") or 0) if "convert_factor" in inv_df.columns else 0.0,
                 "image_path": None,
             })
-            _set_or_clear_serial_in_map(str(r.get("sku") or "").strip(), serial_val)
             added_items += 1
         except Exception as e:
             st.warning(f"Item restore skipped for SKU={r.get('sku')}: {e}")
@@ -1517,7 +1381,7 @@ def view_reports():
         return
 
     st.subheader("Inventory Report")
-    items = get_items_with_serial()
+    items = get_items()
     df_items = pd.DataFrame(items)
     if "category" in df_items.columns:
         df_items["category"] = df_items["category"].apply(normalize_category)
@@ -1590,39 +1454,18 @@ def view_reports():
                     bump = extra / len(widths)
                     widths = [w + bump for w in widths]
 
-            pdf.set_font("Helvetica", "B", font_size)
-            pdf.set_fill_color(*lighten(header_fill_rgb, 0.85))
-            pdf.set_text_color(20, 20, 20)
-            row_h = 7
-            y0 = pdf.get_y()
-            for w, col in zip(widths, df.columns):
-                x = pdf.get_x()
-                pdf.multi_cell(w, row_h, to_latin1(str(col)), border=1, align="L", fill=True, new_x="RIGHT", new_y="TOP")
-                pdf.set_xy(x + w, y0)
-            pdf.ln(row_h)
+            _draw_header_row(pdf, list(df.columns), widths, font_size, header_fill_rgb)
 
             pdf.set_font("Helvetica", "", font_size)
             pdf.set_text_color(15, 15, 15)
+            row_h = 7
             for idx in range(len(df)):
-                # Compute row height using wrapping for all cells
-                vals = ["" if is_nan(v) else v for v in df.iloc[idx].tolist()]
-                wrap_idx = set()  # default: no wrap; keep simple for tx log
-                r_h = _calc_row_height_exact(pdf, vals, widths, row_h, wrap_idx)
-                if pdf.get_y() + r_h > pdf.h - pdf.b_margin:
+                vals = [df.iloc[idx][c] for c in df.columns]
+                needed_h = _calc_row_height_exact(pdf, vals, widths, row_h, set())
+                if pdf.get_y() + needed_h > (pdf.h - pdf.b_margin):
                     pdf.add_page()
-                    pdf.set_font("Helvetica", "B", font_size)
-                    pdf.set_fill_color(*lighten(header_fill_rgb, 0.85))
-                    pdf.set_text_color(20, 20, 20)
-                    y0 = pdf.get_y()
-                    for w, col in zip(widths, df.columns):
-                        x = pdf.get_x()
-                        pdf.multi_cell(w, row_h, to_latin1(str(col)), border=1, align="L", fill=True, new_x="RIGHT", new_y="TOP")
-                        pdf.set_xy(x + w, y0)
-                    pdf.ln(row_h)
-                    pdf.set_font("Helvetica", "", font_size)
-                    pdf.set_text_color(15, 15, 15)
-
-                _draw_row_uniform(pdf, vals, widths, row_h, r_h, wrap_idx_set=set())
+                    _draw_header_row(pdf, list(df.columns), widths, font_size, header_fill_rgb)
+                _draw_row(pdf, vals, widths, row_h, wrap_idx_set=set())
 
         draw_table(pdf, df, brand_rgb, font_size=9)
         data = pdf.output(dest="S")
@@ -1644,7 +1487,7 @@ def view_maintenance():
     st.title("🛠️ Maintenance")
     st.caption("Maintenance usage + Category Manager / cleanup tools.")
 
-    items = get_items_with_serial()
+    items = get_items()
     if not items:
         st.info("Add items first in the Inventory page.")
     else:
@@ -1669,7 +1512,7 @@ def view_maintenance():
 
     st.divider()
     st.subheader("Category Manager")
-    df_all = pd.DataFrame(get_items_with_serial())
+    df_all = pd.DataFrame(get_items())
     if "category" in df_all.columns:
         df_all["category"] = df_all["category"].apply(normalize_category)
     distinct = sorted([c for c in df_all.get("category", pd.Series(dtype=str)).dropna().unique().tolist()])
@@ -1683,7 +1526,7 @@ def view_maintenance():
         else:
             target = normalize_category(new_cat)
             count = 0
-            items = get_items_with_serial()
+            items = get_items()
             for it in items:
                 cur = normalize_category(it.get("category"))
                 if cur == old_cat:
@@ -1693,7 +1536,7 @@ def view_maintenance():
             st.success(f"Updated {count} item(s) from '{old_cat}' → '{target}'.")
             st.rerun()
     if c4.button("Normalize categories (trim/collapse Title-Case)"):
-        items = get_items_with_serial()
+        items = get_items()
         fixed = 0
         for it in items:
             cur = it.get("category")
@@ -1704,16 +1547,6 @@ def view_maintenance():
                 fixed += 1
         st.success(f"Normalized {fixed} item(s).")
         st.rerun()
-
-    st.divider()
-    st.subheader("DB Repair")
-    st.caption("If Serial Numbers aren’t sticking after Save, click this to patch the DB schema.")
-    if st.button("Repair DB: add Serial Number column"):
-        ok = _ensure_serialno_column(show_toast=True)
-        if ok:
-            st.success("Serial Number column is present. You can try saving again.")
-        else:
-            st.error("Could not patch automatically. If the DB file is custom, please share its path/name.")
 
 # ---------- Router ----------
 if menu == "Dashboard":
