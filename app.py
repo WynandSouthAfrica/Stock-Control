@@ -1,8 +1,9 @@
 # app.py — OpperWorks Stock Take (Streamlit)
-# Update: Fix in-grid editing persistence + safe delete (only deletes rows removed from the *visible* grid).
-# - All columns editable (incl. SKU); Updated timestamp auto-filled on save.
-# - Deletions only affect rows that were visible in the editor before saving (filters no longer wipe other items).
-# - Added disabled "Updated" column; minor branding auto-detect tweak (OpperWorks logo fallback).
+# Update: Force-persist edits (delete+reinsert on save), robust rename, safe delete (visible grid only).
+# - All columns editable (incl. SKU); updated_at written on save.
+# - Force replace ensures every field change sticks, regardless of DB merge rules.
+# - Safe delete only removes rows that were visible in the grid before saving.
+# - Auto-detect OpperWorks logo (fallback) if none saved.
 
 import os, json, re, io, zipfile, glob, math, shutil
 import datetime as dt
@@ -933,7 +934,7 @@ def view_inventory():
     # Add an "orig_sku" reference column (read-only) to enable rename+delete logic
     fdf["orig_sku"] = fdf["sku"]
 
-    # --- NEW: capture which rows were visible BEFORE editing (for safe deletion) ---
+    # Capture which rows are visible BEFORE editing (for safe deletion)
     visible_before_skus = set(fdf["orig_sku"].dropna().astype(str))
 
     st.subheader("Inventory (editable grid)")
@@ -947,6 +948,8 @@ def view_inventory():
         height=900,
         hide_index=True,
         column_config={
+            "sku": st.column_config.TextColumn(required=True),
+            "name": st.column_config.TextColumn(required=False),
             "quantity": st.column_config.NumberColumn(format="%.3f"),
             "min_qty": st.column_config.NumberColumn(format="%.3f"),
             "unit_cost": st.column_config.NumberColumn(format="%.2f"),
@@ -957,29 +960,28 @@ def view_inventory():
     )
 
     if st.button("💾 Save (Upsert / Rename / Delete)"):
-        # Helper: clean string
         def _s(x):
             return str(x).strip() if pd.notna(x) and str(x).strip() != "" else None
 
         now_ts = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        rows = edited.fillna("").to_dict("records")
 
-        # All new SKUs present after edit (used for safe deletion pass)
+        # Build a set of current DB SKUs to detect updates
+        existing_skus = {str(i.get("sku")) for i in items if i.get("sku")}
         new_skus_after = set()
-        rows = edited.to_dict("records")
+
         for r in rows:
             sku = _s(r.get("sku"))
-            name = _s(r.get("name"))
-            if not sku or not name:
-                # ignore incomplete new/blank rows
+            if not sku:
+                # Skip blank rows
                 continue
 
-            # collect for deletion comparison later
             new_skus_after.add(sku)
 
             payload = {
                 "sku": sku,
                 "serial_no": _s(r.get("serial_no")),
-                "name": name,
+                "name": _s(r.get("name")),
                 "category": normalize_category(_s(r.get("category"))),
                 "location": _s(r.get("location")),
                 "unit": _s(r.get("unit")),
@@ -994,27 +996,36 @@ def view_inventory():
             }
 
             orig = _s(r.get("orig_sku"))
+
+            # Robust rename: if orig exists and changed -> insert new then delete old
             if orig and orig != sku:
-                # Rename: insert new SKU, then remove old
                 add_or_update_item(payload)
                 try:
                     delete_item(orig)
                 except Exception:
                     pass
-            else:
-                # Upsert
+
+            # Force replace to make sure every edit persists (handles DBs that only partially merge)
+            elif sku in existing_skus:
+                try:
+                    delete_item(sku)
+                except Exception:
+                    pass
                 add_or_update_item(payload)
 
-        # --- NEW: Safe deletions ONLY for rows that were visible before editing ---
-        # Prevents accidental deletion of items hidden by filters.
+            else:
+                # New insert
+                add_or_update_item(payload)
+
+        # Safe deletions: only delete rows removed from the VISIBLE grid
         to_delete = (visible_before_skus - new_skus_after)
-        for sku in to_delete:
+        for dsku in to_delete:
             try:
-                delete_item(sku)
+                delete_item(dsku)
             except Exception:
                 pass
 
-        st.success("Saved (upserted, renamed, and deleted where applicable).")
+        st.success("Saved. All visible edits applied.")
         st.rerun()
 
 def view_transactions():
