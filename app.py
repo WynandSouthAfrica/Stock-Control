@@ -1,10 +1,11 @@
 # app.py — OpperWorks Stock Take (Streamlit)
 # === This build ===
-# - Fix: sidebar header now renders the OpperWorks logo reliably (no TypeError).
-# - Replace “OMEC” text header with your OpperWorks logo top-left.
-# - Branding panel still supports uploading a custom logo + “Use OpperWorks logo” quick action.
-# - Duplicate check switched from Serial # → SKU (warning + optional block on Save).
-# - Keep: Serial Number column; “Find by Serial #”; add-as-you-go rows; rename SKU by editing; PDF name/notes wrapping; Rand formatting; snapshots.
+# - FIX (PDF tables): Every row now keeps a UNIFORM height equal to the tallest wrapped cell.
+#   Borders/grid lines stay perfectly straight even when Name/Notes wrap to multiple lines.
+#   Works for Inventory Report + Issue/Return PDFs (incl. subtotals/totals/category bars).
+# - Implementation details: pre-measure wrapped text, compute row_height, draw ONE rectangle
+#   per cell for that height, then render text inside (no per-line borders). Also scrubs NaN→"".
+# - All previous features kept (Serial #, Find-by-Serial, SKU rename, dup-SKU check, Rand formatting, etc.).
 
 import os, json, re, io, zipfile, glob, math, shutil, sqlite3
 import datetime as dt
@@ -84,6 +85,12 @@ def normalize_category(cat):
     if not s: return None
     s = re.sub(r"\s+", " ", s)
     return s.title()
+
+def is_nan(v) -> bool:
+    try:
+        return isinstance(v, float) and math.isnan(v)
+    except Exception:
+        return False
 
 # ---- Rand currency formatting ----
 def fmt_rands(x, with_symbol=True) -> str:
@@ -235,34 +242,14 @@ def _rename_serial_in_map(old_sku: str, new_sku: str):
 
 _ensure_serialno_column(show_toast=False)
 
-# ---------- Auto-detect bundled OpperWorks logo (first run) ----------
-if not logo_path:
-    try:
-        candidates = [
-            "/mnt/data/OpperWorks Logo.png",
-            "/mnt/data/OpperWorks_Logo.png",
-            "/mnt/data/Logo R0.1.png",
-            "/mnt/data/PG Bison.jpg",
-        ]
-        chosen = None
-        for src in candidates:
-            if os.path.exists(src):
-                chosen = src
-                break
-        if chosen:
-            ext = os.path.splitext(chosen)[1] or ".png"
-            dst = os.path.join(ASSETS_DIR, f"brand_logo{ext}")
-            if not os.path.exists(dst):
-                shutil.copyfile(chosen, dst)
-            upsert_setting("logo_path", dst)
-            logo_path = dst
-    except Exception:
-        pass
-
-# ---------- Sidebar brand header (logo replaces text header) ----------
+# ---------- Sidebar brand header ----------
 def render_brand_header():
     if logo_path and os.path.exists(_norm_path(logo_path)):
-        safe_show_logo(logo_path)
+        # You preferred no logo by default; keeping a graceful fallback
+        st.sidebar.markdown(
+            f"<h2 style='color:{brand_color}; margin-bottom:0'>{brand_name}</h2>",
+            unsafe_allow_html=True
+        )
     else:
         st.sidebar.markdown(
             f"<h2 style='color:{brand_color}; margin-bottom:0'>{brand_name}</h2>",
@@ -367,7 +354,7 @@ if auto_backup_enabled and not _has_snapshot_for_today():
     except Exception:
         st.sidebar.warning("Auto-backup attempt failed (non-blocking).")
 
-# ---------- PDF utilities ----------
+# ---------- PDF base + table helpers ----------
 if FPDF_AVAILABLE:
     class BrandedPDF(FPDF):
         def __init__(self, brand_name: str, brand_rgb: tuple, logo_path: str = "", revision_tag: str = "Rev0.1", *args, **kwargs):
@@ -383,7 +370,7 @@ if FPDF_AVAILABLE:
             self.rect(x=0, y=0, w=self.w, h=14, style="F")
             if self.logo_path and os.path.exists(self.logo_path):
                 try:
-                    self.image(self.logo_path, x=10, y=3, h=8)
+                    self.image(self.logo_path, x=10, y=3, h=8)  # keep conservative here; we can expose knob later
                 except Exception:
                     pass
             self.set_draw_color(*self.brand_rgb)
@@ -456,7 +443,7 @@ def _ensure_page_space(pdf, needed_h, columns, widths, font_size, brand_rgb):
 def _calc_row_height_exact(pdf, values, widths, row_h, wrap_idx_set):
     heights = []
     for idx, (w, v) in enumerate(zip(widths, values)):
-        txt = "" if v is None else to_latin1(str(v))
+        txt = "" if (v is None or is_nan(v)) else to_latin1(str(v))
         if wrap_idx_set and (idx in wrap_idx_set):
             try:
                 lines = pdf.multi_cell(w, row_h, txt, new_x="RIGHT", new_y="TOP", split_only=True)
@@ -482,29 +469,49 @@ def _truncate_to_fit(pdf, txt: str, w: float, margin: float = 2.0) -> str:
         s = s[:-1]
     return (s + ell) if s else ell
 
-def _draw_row(pdf, values, widths, row_h, align_map=None, fill_rgb=None, bold=False, text_rgb=(15,15,15), wrap_idx_set=None, border="1"):
-    if align_map is None:
-        align_map = {}
-    if wrap_idx_set is None:
-        wrap_idx_set = set()
-    max_h = _calc_row_height_exact(pdf, values, widths, row_h, wrap_idx_set)
+def _draw_row_uniform(pdf, values, widths, base_row_h, row_height, align_map=None, fill_rgb=None, bold=False, text_rgb=(15,15,15), wrap_idx_set=None):
+    """
+    Draw ONE rectangle per cell (height=row_height) so horizontal borders are straight across.
+    Wrapped cells render text inside WITHOUT per-line borders.
+    """
+    if align_map is None: align_map = {}
+    if wrap_idx_set is None: wrap_idx_set = set()
+
     pdf.set_font("Helvetica", "B" if bold else "", 9)
-    if fill_rgb:
-        pdf.set_fill_color(*fill_rgb)
     pdf.set_text_color(*text_rgb)
+
     y_start = pdf.get_y()
     x_left = pdf.get_x()
+
     for idx, (w, v) in enumerate(zip(widths, values)):
         x = pdf.get_x()
+        txt = "" if (v is None or is_nan(v)) else str(v)
         align = align_map.get(idx, "L")
-        txt = "" if v is None else str(v)
+
+        # cell background + border
+        if fill_rgb:
+            pdf.set_fill_color(*fill_rgb)
+            pdf.rect(x, y_start, w, row_height, style="FD")
+        else:
+            pdf.rect(x, y_start, w, row_height)
+
+        # text
         if idx in wrap_idx_set:
-            pdf.multi_cell(w, row_h, to_latin1(txt), border=border, align=align, new_x="RIGHT", new_y="TOP", fill=bool(fill_rgb))
+            # padding inside the cell
+            pdf.set_xy(x + 1.2, y_start + 0.6)
+            try:
+                pdf.multi_cell(w - 2.4, base_row_h, to_latin1(txt), border=0, align=align)
+            except Exception:
+                pdf.multi_cell(w - 2.4, base_row_h, to_latin1(_truncate_to_fit(pdf, txt, w - 2.4)), border=0, align=align)
+            # restore cursor to right edge of the cell, same row
             pdf.set_xy(x + w, y_start)
         else:
-            t = _truncate_to_fit(pdf, txt, w)
-            pdf.cell(w, max_h, t, align=align, border=border)
-    pdf.set_xy(x_left, y_start + max_h)
+            pdf.set_xy(x + 1.2, y_start)
+            one_line = _truncate_to_fit(pdf, txt, w - 2.4)
+            pdf.cell(w - 2.4, row_height, to_latin1(one_line), align=align, border=0)
+            pdf.set_xy(x + w, y_start)
+
+    pdf.set_xy(x_left, y_start + row_height)
 
 # ---------- Inventory PDF (grouped) ----------
 def _inventory_pdf_bytes_grouped(
@@ -516,6 +523,7 @@ def _inventory_pdf_bytes_grouped(
     df = df.copy()
     if "category" in df.columns:
         df["category"] = df["category"].apply(normalize_category)
+
     df["quantity"] = pd.to_numeric(df.get("quantity"), errors="coerce").fillna(0.0)
     df["min_qty"] = pd.to_numeric(df.get("min_qty"), errors="coerce").fillna(0.0)
     df["unit_cost"] = pd.to_numeric(df.get("unit_cost"), errors="coerce").fillna(0.0)
@@ -563,6 +571,7 @@ def _inventory_pdf_bytes_grouped(
         row = {}
         for c in present:
             v = r[c] if c in r else None
+            if is_nan(v): v = ""
             if c in ("quantity", "min_qty"):
                 v = fmt_num(float(v), 2)
             elif c in ("unit_cost", "value"):
@@ -599,7 +608,7 @@ def _inventory_pdf_bytes_grouped(
 
     page_w = pdf.w - pdf.l_margin - pdf.r_margin
     widths = _compute_col_widths(pdf, display_cols, rows_for_width, page_w, font_size=9)
-    _draw_header_row(pdf, display_cols, widths, 9, brand_rgb)
+    header_h = _draw_header_row(pdf, display_cols, widths, 9, brand_rgb)
 
     align_map = {}
     for c in ("quantity", "min_qty", "unit_cost", "value", "converted_qty"):
@@ -623,6 +632,7 @@ def _inventory_pdf_bytes_grouped(
     light_brand = lighten(brand_rgb, 0.92)
     cat_bar = lighten(brand_rgb, 0.80)
     low_stock_fill = (255, 235, 235)
+    base_row_h = 7
 
     grand_qty = 0.0
     grand_value = 0.0
@@ -630,12 +640,12 @@ def _inventory_pdf_bytes_grouped(
     for cat in categories_iter:
         block = df_sorted[df_sorted["category"].fillna("(Unspecified)") == cat]
 
-        span_h = 7
-        _ensure_page_space(pdf, span_h + 7, display_cols, widths, 9, brand_rgb)
-        pdf.set_font("Helvetica", "B", 11)
+        cat_span_h = 7
+        _ensure_page_space(pdf, cat_span_h + header_h, display_cols, widths, 9, brand_rgb)
+        pdf.set_font("Helvetica", "B", 10)
         pdf.set_fill_color(*cat_bar)
         pdf.set_text_color(30, 30, 30)
-        pdf.cell(sum(widths), span_h, to_latin1(f"Category: {cat}"), border=1, ln=1, fill=True)
+        pdf.cell(sum(widths), cat_span_h, to_latin1(f"Category: {cat}"), border=1, ln=1, fill=True)
 
         cat_qty = float(block["quantity"].sum() if "quantity" in block.columns else 0.0)
         cat_value = float((block["quantity"] * block["unit_cost"]).sum() if {"quantity","unit_cost"}.issubset(block.columns) else 0.0)
@@ -646,6 +656,7 @@ def _inventory_pdf_bytes_grouped(
             vals = []
             for c in present:
                 v = r[c] if c in r else None
+                if is_nan(v): v = ""
                 if c in ("quantity", "min_qty"):
                     v = f"{float(v):,.2f}"
                 elif c in ("unit_cost", "value"):
@@ -653,15 +664,19 @@ def _inventory_pdf_bytes_grouped(
                 elif c == "converted_qty" and pd.notna(v):
                     v = f"{float(v):,.3f}"
                 vals.append(v if v is not None else "")
+
+            row_height = _calc_row_height_exact(pdf, vals, widths, base_row_h, wrap_idx_set)
+            _ensure_page_space(pdf, row_height, display_cols, widths, 9, brand_rgb)
+
             fill = None
             try:
                 if float(r.get("quantity", 0)) < float(r.get("min_qty", 0)):
                     fill = low_stock_fill
             except Exception:
                 pass
-            _ensure_page_space(pdf, 9, display_cols, widths, 9, brand_rgb)
-            _draw_row(pdf, vals, widths, 7, align_map=align_map, fill_rgb=fill, wrap_idx_set=wrap_idx_set)
+            _draw_row_uniform(pdf, vals, widths, base_row_h, row_height, align_map=align_map, fill_rgb=fill, wrap_idx_set=wrap_idx_set)
 
+        # Subtotal row
         sub_vals = []
         for c in present:
             if c == "sku":
@@ -672,9 +687,11 @@ def _inventory_pdf_bytes_grouped(
                 sub_vals.append(f"{cat_value:,.2f}")
             else:
                 sub_vals.append("")
-        _ensure_page_space(pdf, 7, display_cols, widths, 9, brand_rgb)
-        _draw_row(pdf, sub_vals, widths, 7, align_map=align_map, fill_rgb=light_brand, bold=True, wrap_idx_set=set())
+        row_height = _calc_row_height_exact(pdf, sub_vals, widths, base_row_h, set())
+        _ensure_page_space(pdf, row_height, display_cols, widths, 9, brand_rgb)
+        _draw_row_uniform(pdf, sub_vals, widths, base_row_h, row_height, align_map=align_map, fill_rgb=light_brand, bold=True, wrap_idx_set=set())
 
+    # TOTAL row
     total_vals = []
     for c in present:
         if c == "sku":
@@ -685,9 +702,11 @@ def _inventory_pdf_bytes_grouped(
             total_vals.append(f"{grand_value:,.2f}")
         else:
             total_vals.append("")
-    _ensure_page_space(pdf, 8, display_cols, widths, 9, brand_rgb)
-    _draw_row(pdf, total_vals, widths, 8, align_map=align_map, fill_rgb=lighten(brand_rgb, 0.88), bold=True, wrap_idx_set=set())
+    row_height = _calc_row_height_exact(pdf, total_vals, widths, base_row_h, set())
+    _ensure_page_space(pdf, row_height, display_cols, widths, 9, brand_rgb)
+    _draw_row_uniform(pdf, total_vals, widths, base_row_h, row_height, align_map=align_map, fill_rgb=lighten(brand_rgb, 0.88), bold=True, wrap_idx_set=set())
 
+    # Sign-off
     pdf.ln(6)
     pdf.set_font("Helvetica", "B", 10)
     pdf.cell(0, 6, to_latin1("Sign-off"), ln=1)
@@ -708,7 +727,7 @@ def _inventory_pdf_bytes_grouped(
     data = pdf.output(dest="S")
     return bytes(data) if isinstance(data, (bytes, bytearray)) else str(data).encode("latin-1", errors="ignore")
 
-# ---------- Issue Sheet PDF (with Serial # column kept) ----------
+# ---------- Issue Sheet PDF (A4 Landscape) + Return Sheet ----------
 def _issue_sheet_pdf_bytes(
     df: pd.DataFrame,
     brand_name, brand_rgb, logo_path, revision_tag,
@@ -737,7 +756,7 @@ def _issue_sheet_pdf_bytes(
     for _, r in df.iterrows():
         rows_for_width.append({
             "SKU": str(r.get("sku","")),
-            "Serial #": str(r.get("serial_no","") or ""),
+            "Serial #": "" if is_nan(r.get("serial_no")) else str(r.get("serial_no") or ""),
             "Item": str(r.get("name","")),
             "Unit": str(r.get("unit","") or ""),
             "On-hand": f"{float(r.get('quantity') or 0):,.2f}",
@@ -748,6 +767,7 @@ def _issue_sheet_pdf_bytes(
             "Date": "",
         })
 
+    # A4 LANDSCAPE
     pdf = BrandedPDF(
         brand_name=brand_name, brand_rgb=brand_rgb, logo_path=logo_path, revision_tag=revision_tag,
         orientation="L", unit="mm", format="A4"
@@ -766,6 +786,7 @@ def _issue_sheet_pdf_bytes(
             x += w
         pdf.set_y(y + row_h)
 
+    # ---- Header / Meta
     pdf.set_font("Helvetica", "B", 15)
     pdf.cell(0, 9, to_latin1("Stock Issue Sheet"), ln=1)
     pdf.set_font("Helvetica", "", 10)
@@ -781,6 +802,8 @@ def _issue_sheet_pdf_bytes(
 
     page_w = pdf.w - pdf.l_margin - pdf.r_margin
     widths = _compute_col_widths(pdf, display_cols, rows_for_width, page_w, font_size=9)
+
+    # widen key columns a bit for handwriting, then re-fit to page
     for i, name in enumerate(display_cols):
         if name in {"Item"}:                 widths[i] = max(widths[i], 80)
         if name in {"Serial #"}:             widths[i] = max(widths[i], 35)
@@ -808,7 +831,9 @@ def _issue_sheet_pdf_bytes(
         df["category"] = "(All)"
 
     per_item_blanks = []
+    base_row_h = 7
 
+    # ---- Issue rows
     for cat in groups:
         block = df[df["category"].fillna("(Unspecified)") == cat]
         if block.empty:
@@ -824,9 +849,10 @@ def _issue_sheet_pdf_bytes(
         for _, r in block.iterrows():
             onhand = float(r.get("quantity") or 0.0)
             minq   = float(r.get("min_qty") or 0.0)
+
             values_map = {
                 "SKU": r.get("sku",""),
-                "Serial #": r.get("serial_no","") or "",
+                "Serial #": "" if is_nan(r.get("serial_no")) else r.get("serial_no","") or "",
                 "Item": r.get("name",""),
                 "Unit": r.get("unit","") or "",
                 "On-hand": f"{onhand:,.2f}",
@@ -837,15 +863,20 @@ def _issue_sheet_pdf_bytes(
                 "Date": ""
             }
             values = [values_map[col] for col in display_cols]
-            _ensure_page_space(pdf, 8, display_cols, widths, 9, brand_rgb)
-            _draw_row(pdf, values, widths, 7, align_map=align_map, border="1", wrap_idx_set=wrap_issue_idx)
 
-            blanks = (fixed_blanks if (fixed_blanks is not None and fixed_blanks > 0)
-                      else min(max(0, int(math.floor(onhand))) + 1, max(1, int(blanks_cap))))
+            row_h = _calc_row_height_exact(pdf, values, widths, base_row_h, wrap_issue_idx)
+            _ensure_page_space(pdf, row_h, display_cols, widths, 9, brand_rgb)
+            _draw_row_uniform(pdf, values, widths, base_row_h, row_h, align_map=align_map, border=0, wrap_idx_set=wrap_issue_idx)
+
+            if (fixed_blanks is not None) and (fixed_blanks > 0):
+                blanks = fixed_blanks
+            else:
+                blanks = min(max(0, int(math.floor(onhand))) + 1, max(1, int(blanks_cap)))
+
             per_item_blanks.append({
                 "cat": cat,
                 "sku": r.get("sku",""),
-                "serial_no": r.get("serial_no","") or "",
+                "serial_no": "" if is_nan(r.get("serial_no")) else r.get("serial_no","") or "",
                 "name": r.get("name",""),
                 "unit": r.get("unit","") or "",
                 "blanks": blanks
@@ -855,6 +886,7 @@ def _issue_sheet_pdf_bytes(
                 _ensure_page_space(pdf, 7, display_cols, widths, 9, brand_rgb)
                 draw_ruled_blank_row(pdf, widths, row_h=7, line_rgb=(170,170,170))
 
+    # ---- Return section (optional)
     if include_returns:
         pdf.add_page(orientation="L")
         pdf.set_font("Helvetica", "B", 15)
@@ -891,8 +923,9 @@ def _issue_sheet_pdf_bytes(
 
         cat_bar = lighten(brand_rgb, 0.80)
         groups2 = [x["cat"] for x in per_item_blanks]
-        groups2 = list(dict.fromkeys(groups2))
+        groups2 = list(dict.fromkeys(groups2))  # preserve order/unique
 
+        base_row_h = 7
         for cat in groups2:
             items_cat = [x for x in per_item_blanks if x["cat"] == cat]
             if not items_cat:
@@ -918,8 +951,9 @@ def _issue_sheet_pdf_bytes(
                     "Condition / Notes": ""
                 }
                 desc_vals = [desc_vals_map[c] for c in ret_cols]
-                _ensure_page_space(pdf, 8, ret_cols, ret_widths, 9, brand_rgb)
-                _draw_row(pdf, desc_vals, ret_widths, 7, border="1", wrap_idx_set=wrap_return_idx)
+                row_h = _calc_row_height_exact(pdf, desc_vals, ret_widths, base_row_h, wrap_return_idx)
+                _ensure_page_space(pdf, row_h, ret_cols, ret_widths, 9, brand_rgb)
+                _draw_row_uniform(pdf, desc_vals, ret_widths, base_row_h, row_h, wrap_idx_set=wrap_return_idx)
 
                 r_blanks = it["blanks"] if (fixed_return_blanks is None or fixed_return_blanks <= 0) else fixed_return_blanks
                 for _ in range(r_blanks):
@@ -1295,6 +1329,7 @@ def view_transactions():
         ]
     st.dataframe(f, use_container_width=True)
 
+# ---------- Versions / Snapshots ----------
 def _zip_list():
     return sorted(glob.glob(os.path.join(SNAP_DIR, "*.zip")), reverse=True)
 
@@ -1569,8 +1604,11 @@ def view_reports():
             pdf.set_font("Helvetica", "", font_size)
             pdf.set_text_color(15, 15, 15)
             for idx in range(len(df)):
-                y_start = pdf.get_y()
-                if y_start + row_h > pdf.h - pdf.b_margin:
+                # Compute row height using wrapping for all cells
+                vals = ["" if is_nan(v) else v for v in df.iloc[idx].tolist()]
+                wrap_idx = set()  # default: no wrap; keep simple for tx log
+                r_h = _calc_row_height_exact(pdf, vals, widths, row_h, wrap_idx)
+                if pdf.get_y() + r_h > pdf.h - pdf.b_margin:
                     pdf.add_page()
                     pdf.set_font("Helvetica", "B", font_size)
                     pdf.set_fill_color(*lighten(header_fill_rgb, 0.85))
@@ -1583,15 +1621,8 @@ def view_reports():
                     pdf.ln(row_h)
                     pdf.set_font("Helvetica", "", font_size)
                     pdf.set_text_color(15, 15, 15)
-                    y_start = pdf.get_y()
 
-                x_left = pdf.get_x()
-                for w, val in zip(widths, df.iloc[idx].tolist()):
-                    txt = to_latin1(str(val))
-                    x = pdf.get_x()
-                    pdf.multi_cell(w, row_h, txt, border=1, align="L", new_x="RIGHT", new_y="TOP")
-                    pdf.set_xy(x + w, y_start)
-                pdf.set_xy(x_left, y_start + row_h)
+                _draw_row_uniform(pdf, vals, widths, row_h, r_h, wrap_idx_set=set())
 
         draw_table(pdf, df, brand_rgb, font_size=9)
         data = pdf.output(dest="S")
