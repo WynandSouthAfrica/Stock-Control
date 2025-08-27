@@ -1,9 +1,9 @@
 # app.py — OpperWorks Stock Take (Streamlit)
-# Update: Force-persist edits (delete+reinsert on save), robust rename, safe delete (visible grid only).
-# - All columns editable (incl. SKU); updated_at written on save.
-# - Force replace ensures every field change sticks, regardless of DB merge rules.
-# - Safe delete only removes rows that were visible in the grid before saving.
-# - Auto-detect OpperWorks logo (fallback) if none saved.
+# Fixes:
+# - Filter-safe saving (auto-clear filters on save + post-save banner if filters would hide rows)
+# - Force-persist edits (delete+reinsert), robust rename, safe delete (visible grid only)
+# - All columns editable; updated_at stamped on save
+# - OpperWorks logo fallback if none saved
 
 import os, json, re, io, zipfile, glob, math, shutil
 import datetime as dt
@@ -886,9 +886,25 @@ def view_dashboard():
             st.text_area("Email body (copy/paste)", value=body, height=120)
             st.markdown(f"[Open email draft]({mailto})")
 
+def _row_matches_filters(row: dict, filt: str, serial_q: str) -> bool:
+    """Check whether a row matches the simple text filters used in the grid."""
+    def _s(v): return ("" if v is None else str(v)).lower()
+    ok = True
+    if filt:
+        f = filt.lower()
+        ok = (f in _s(row.get("sku")) or f in _s(row.get("name")) or f in _s(row.get("category")) or f in _s(row.get("location")))
+    if ok and serial_q:
+        s = serial_q.lower()
+        ok = s in _s(row.get("serial_no"))
+    return ok
+
 def view_inventory():
     st.title("📦 Inventory")
-    st.caption("Single in-grid editor: add new rows, edit everything (including SKU), remove rows, then **Save**.")
+    st.caption("In-grid editor: add rows, edit everything (incl. SKU), remove rows, then **Save**. Filters are cleared on save by default so you don't lose sight of edited rows.")
+
+    # Preferences (persisted in session only)
+    if "inv_clear_filters" not in st.session_state:
+        st.session_state["inv_clear_filters"] = True
 
     # Load items and normalize
     items = get_items()
@@ -896,10 +912,11 @@ def view_inventory():
     if "category" in df.columns:
         df["category"] = df["category"].apply(normalize_category)
 
-    # Quick filters (optional)
-    colf1, colf2 = st.columns([1,1])
-    filt = colf1.text_input("Filter (SKU/Name/Category/Location contains…)")
-    serial_q = colf2.text_input("Find by Serial #")
+    # Quick filters (with keys so we can clear them on save)
+    colf1, colf2, colf3 = st.columns([1,1,1])
+    filt = colf1.text_input("Filter (SKU/Name/Category/Location contains…)", key="inv_filter", value=st.session_state.get("inv_filter", ""))
+    serial_q = colf2.text_input("Find by Serial #", key="inv_serial_filter", value=st.session_state.get("inv_serial_filter", ""))
+    colf3.checkbox("Clear filters on Save", key="inv_clear_filters", value=st.session_state["inv_clear_filters"])
 
     # Ensure all columns exist for the grid
     all_cols = ["sku","serial_no","name","category","location","unit","quantity","min_qty","unit_cost",
@@ -937,6 +954,16 @@ def view_inventory():
     # Capture which rows are visible BEFORE editing (for safe deletion)
     visible_before_skus = set(fdf["orig_sku"].dropna().astype(str))
 
+    # Post-save banner (if present)
+    if "inv_save_feedback" in st.session_state:
+        fb = st.session_state.pop("inv_save_feedback")
+        msg = f"Saved {fb.get('saved',0)} row(s)"
+        if fb.get("renamed",0): msg += f" | Renamed {fb['renamed']}"
+        if fb.get("deleted",0): msg += f" | Deleted {fb['deleted']}"
+        if fb.get("hidden_by_filter",0):
+            msg += f" | Note: {fb['hidden_by_filter']} row(s) would be hidden by your filter"
+        st.success(msg)
+
     st.subheader("Inventory (editable grid)")
     show_cols = ["sku","serial_no","name","category","location","unit","quantity","min_qty","unit_cost",
                  "convert_to","convert_factor","notes","updated_at","orig_sku"]
@@ -970,10 +997,29 @@ def view_inventory():
         existing_skus = {str(i.get("sku")) for i in items if i.get("sku")}
         new_skus_after = set()
 
+        saved = 0
+        renamed = 0
+        deleted = 0
+        hidden_by_filter = 0
+
+        # Pre-check for "would be hidden" AFTER edits with current filters
+        for r in rows:
+            # emulate row after save
+            sim = {
+                "sku": _s(r.get("sku")),
+                "serial_no": _s(r.get("serial_no")),
+                "name": _s(r.get("name")),
+                "category": normalize_category(_s(r.get("category"))),
+                "location": _s(r.get("location")),
+            }
+            if sim["sku"]:
+                if not _row_matches_filters(sim, st.session_state.get("inv_filter",""), st.session_state.get("inv_serial_filter","")):
+                    hidden_by_filter += 1
+
         for r in rows:
             sku = _s(r.get("sku"))
             if not sku:
-                # Skip blank rows
+                # Skip blank new rows
                 continue
 
             new_skus_after.add(sku)
@@ -1004,28 +1050,41 @@ def view_inventory():
                     delete_item(orig)
                 except Exception:
                     pass
+                saved += 1
+                renamed += 1
 
-            # Force replace to make sure every edit persists (handles DBs that only partially merge)
+            # Force replace to make sure every edit persists
             elif sku in existing_skus:
                 try:
                     delete_item(sku)
                 except Exception:
                     pass
                 add_or_update_item(payload)
-
+                saved += 1
             else:
                 # New insert
                 add_or_update_item(payload)
+                saved += 1
 
         # Safe deletions: only delete rows removed from the VISIBLE grid
         to_delete = (visible_before_skus - new_skus_after)
         for dsku in to_delete:
             try:
                 delete_item(dsku)
+                deleted += 1
             except Exception:
                 pass
 
-        st.success("Saved. All visible edits applied.")
+        # Optionally clear filters so edited rows remain visible
+        if st.session_state.get("inv_clear_filters", True):
+            st.session_state["inv_filter"] = ""
+            st.session_state["inv_serial_filter"] = ""
+            # If filters are cleared, nothing will be hidden
+            hidden_by_filter = 0
+
+        st.session_state["inv_save_feedback"] = {
+            "saved": saved, "renamed": renamed, "deleted": deleted, "hidden_by_filter": hidden_by_filter
+        }
         st.rerun()
 
 def view_transactions():
