@@ -1,4 +1,4 @@
-# OMEC Stock Take (Single-file Streamlit App)
+# WOPMann Stock Take (Single-file Streamlit App)
 
 This variant avoids Streamlit's `pages/` feature and keeps everything in **app.py** with a sidebar menu.
 Ideal when emoji filenames or the `pages` folder cause issues on Windows/GitHub.
